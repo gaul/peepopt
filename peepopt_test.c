@@ -18,6 +18,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "peepopt.h"
 #include "xed/xed-interface.h"
@@ -35,17 +36,44 @@ do { \
     } \
 } while (0)
 
+static void check_replace(int line, int expected_count,
+                          const uint8_t *expect, size_t expect_len,
+                          uint8_t *bytes, size_t len)
+{
+    int got = check_shifts(bytes, len, /*replace=*/ true);
+    if (got != expected_count) {
+        fprintf(stderr, "peepopt_test.c:%d: check_shifts returned %d, expected %d\n",
+                line, got, expected_count);
+        ++failures;
+        return;
+    }
+    if (len != expect_len || memcmp(bytes, expect, len) != 0) {
+        fprintf(stderr, "peepopt_test.c:%d: buffer mismatch after replace\n", line);
+        fprintf(stderr, "  got:     ");
+        for (size_t i = 0; i < len; ++i) fprintf(stderr, "%02X ", bytes[i]);
+        fprintf(stderr, "\n  expect:  ");
+        for (size_t i = 0; i < expect_len; ++i) fprintf(stderr, "%02X ", expect[i]);
+        fprintf(stderr, "\n");
+        ++failures;
+    }
+}
+
 int main(int argc, char *argv[])
 {
+    (void)argc; (void)argv;
     xed_tables_init();
     xed_set_verbosity(99);
 
+    /* ------ Original tests ------ */
+
+    // MOV+MOV+SHL, no clobber of ECX/EFLAGS: lookahead exhausts, no rewrite
     CHECK_BYTES(
         0,
         0x89, 0xF8,        // movl %edi,%eax
         0x89, 0xF1,        // movl %esi,%ecx
         0xD3, 0xE0         // sall %cl,%eax
     );
+    // Same plus RET: replacement (5 bytes) is larger than original (4 bytes), skip
     CHECK_BYTES(
         0,
         0x89, 0xF8,        // movl %edi,%eax
@@ -53,6 +81,7 @@ int main(int argc, char *argv[])
         0xD3, 0xE0,        // sall %cl,%eax
         0xC3               // ret
     );
+    // mov %r8d,%ecx is 3 bytes so old_len == new_len: rewrite
     CHECK_BYTES(
         1,
         0x89, 0xF8,        // movl %edi,%eax
@@ -60,7 +89,212 @@ int main(int argc, char *argv[])
         0xD3, 0xE0,        // sall %cl,%eax
         0xC3               // ret
     );
-    // TODO: test reads and writes of ECX and EFLAGS
+
+    /* ------ SHR / SAR variants ------ */
+
+    CHECK_BYTES(
+        1,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE8,        // shrl %cl,%eax
+        0xC3
+    );
+    CHECK_BYTES(
+        1,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xF8,        // sarl %cl,%eax
+        0xC3
+    );
+
+    /* ------ 64-bit shift with RCX/RAX ------ */
+
+    CHECK_BYTES(
+        1,
+        0x48, 0x89, 0xF1,  // movq %rsi,%rcx
+        0x48, 0xD3, 0xE8,  // shrq %cl,%rax
+        0xC3
+    );
+
+    /* ------ 32->64 mov_src promotion: shift_dst=64, mov_src=32 ------ */
+
+    CHECK_BYTES(
+        1,
+        0x89, 0xF1,        // movl %esi,%ecx  (mov_src=ESI, promoted to RSI)
+        0x48, 0xD3, 0xE8,  // shrq %cl,%rax
+        0xC3
+    );
+
+    /* ------ XOR %ecx,%ecx zeroing idiom as clobber ------ */
+
+    CHECK_BYTES(
+        1,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0x31, 0xC9,        // xor %ecx,%ecx  (clobbers ECX + EFLAGS)
+        0xC3
+    );
+
+    /* ------ CALL clobbers ECX, test writes EFLAGS ------ */
+
+    CHECK_BYTES(
+        1,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // call rel32
+        0x85, 0xC0,                    // test %eax,%eax
+        0xC3
+    );
+
+    /* ------ Two independent mov+shift pairs ------ */
+
+    CHECK_BYTES(
+        2,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0x31, 0xC9,        // xor %ecx,%ecx
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0xC3
+    );
+
+    /* ------ Negative: shift with immediate ------ */
+
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,
+        0xC1, 0xE0, 0x03,  // shll $3,%eax
+        0xC3
+    );
+
+    /* ------ Negative: shift with memory destination ------ */
+
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,
+        0xD3, 0x20,        // shll %cl,(%rax)
+        0xC3
+    );
+
+    /* ------ Negative: partial-register shift destination ------ */
+
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,
+        0xD2, 0xE0,        // shlb %cl,%al
+        0xC3
+    );
+
+    /* ------ Negative: shift without preceding MOV ------ */
+
+    CHECK_BYTES(
+        0,
+        0x31, 0xC0,        // xor %eax,%eax
+        0xD3, 0xE0,        // shll %cl,%eax
+        0xC3
+    );
+
+    /* ------ Negative: MOV has a memory operand ------ */
+
+    CHECK_BYTES(
+        0,
+        0x8B, 0x0E,        // movl (%rsi),%ecx
+        0xD3, 0xE0,        // shll %cl,%eax
+        0xC3
+    );
+
+    /* ------ Negative: MOV target is not ECX/RCX ------ */
+
+    CHECK_BYTES(
+        0,
+        0x89, 0xF2,        // movl %esi,%edx
+        0xD3, 0xE0,        // shll %cl,%eax
+        0xC3
+    );
+
+    /* ------ Negative: branch in lookahead before clobber ------ */
+
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0xEB, 0x00,        // jmp +0
+        0xC3
+    );
+
+    /* ------ Negative: ECX read before clobber ------ */
+
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0x89, 0xCA,        // movl %ecx,%edx  (reads ECX)
+        0x31, 0xC9,
+        0xC3
+    );
+
+    /* ------ Negative: EFLAGS read before clobber ------ */
+
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0x0F, 0x94, 0xC2,  // setz %dl  (reads EFLAGS)
+        0x31, 0xC9,
+        0xC3
+    );
+
+    /* ------ Negative: 16-instruction lookahead window exhausts on NOPs ------ */
+
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+        0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90
+    );
+
+    /* ------ Error: truncated instruction ------ */
+
+    CHECK_BYTES(
+        -1,
+        0x0F               // start of 2-byte opcode, missing second byte
+    );
+
+    /* ------ Zero-length input: returns 0 ------ */
+    {
+        uint8_t dummy[1] = {0};
+        int got = check_shifts(dummy, 0, /*replace=*/ false);
+        if (got != 0) {
+            fprintf(stderr, "peepopt_test.c:%d: zero-length check_shifts returned %d, expected 0\n",
+                    __LINE__, got);
+            ++failures;
+        }
+    }
+
+    /* ------ replace=true: verify actual byte rewrite ------ */
+    {
+        uint8_t bytes[] = {
+            0x89, 0xF8,        // movl %edi,%eax
+            0x44, 0x89, 0xC1,  // movl %r8d,%ecx
+            0xD3, 0xE0,        // sall %cl,%eax
+            0xC3,              // ret
+        };
+        uint8_t expect[] = {
+            0x89, 0xF8,                        // movl %edi,%eax (untouched)
+            0xC4, 0xE2, 0x39, 0xF7, 0xC0,      // shlxl %r8d,%eax,%eax
+            0xC3,                              // ret (untouched)
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
