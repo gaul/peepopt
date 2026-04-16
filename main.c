@@ -161,7 +161,14 @@ int main(int argc, char **argv)
             continue;
         }
         uint8_t *buf = (uint8_t *)addr + section_header->sh_offset;
-        rewrites += check_shifts(buf, section_header->sh_size, /*replace=*/ !dry_run);
+        int section_rewrites = check_shifts(buf, section_header->sh_size, /*replace=*/ !dry_run);
+        if (section_rewrites < 0) {
+            fprintf(stderr, "check_shifts failed on section %u\n", idx);
+            munmap(addr, file_size);
+            close(fd);
+            return 1;
+        }
+        rewrites += section_rewrites;
     }
 
     printf("%d rewrites\n", rewrites);

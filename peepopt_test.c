@@ -14,18 +14,25 @@
  * limitations under the License.
  */
 
-#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "peepopt.h"
 #include "xed/xed-interface.h"
 
-#define CHECK_BYTES(func, ...) \
+static int failures = 0;
+
+#define CHECK_BYTES(expected, ...) \
 do { \
     uint8_t bytes[] = { __VA_ARGS__ }; \
-    assert(func(bytes, sizeof(bytes), /*replace=*/ false)); \
+    int got = check_shifts(bytes, sizeof(bytes), /*replace=*/ false); \
+    if (got != (expected)) { \
+        fprintf(stderr, "%s:%d: check_shifts returned %d, expected %d\n", \
+                __FILE__, __LINE__, got, (expected)); \
+        ++failures; \
+    } \
 } while (0)
 
 int main(int argc, char *argv[])
@@ -34,20 +41,20 @@ int main(int argc, char *argv[])
     xed_set_verbosity(99);
 
     CHECK_BYTES(
-        !check_shifts,
+        0,
         0x89, 0xF8,        // movl %edi,%eax
         0x89, 0xF1,        // movl %esi,%ecx
-        0xD3, 0xE0,        // sall %cl,%eax
+        0xD3, 0xE0         // sall %cl,%eax
     );
     CHECK_BYTES(
-        !check_shifts,
+        0,
         0x89, 0xF8,        // movl %edi,%eax
         0x89, 0xF1,        // movl %esi,%ecx
         0xD3, 0xE0,        // sall %cl,%eax
         0xC3               // ret
     );
     CHECK_BYTES(
-        check_shifts,
+        1,
         0x89, 0xF8,        // movl %edi,%eax
         0x44, 0x89, 0xC1,  // movl %r8d,%ecx
         0xD3, 0xE0,        // sall %cl,%eax
@@ -55,5 +62,5 @@ int main(int argc, char *argv[])
     );
     // TODO: test reads and writes of ECX and EFLAGS
 
-    return 0;
+    return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
