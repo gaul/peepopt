@@ -86,40 +86,87 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    void *addr = mmap(/*addr=*/ NULL, /*length=*/ statbuf.st_size, PROT_READ | (dry_run ? 0 : PROT_WRITE), MAP_SHARED, fd, /*offset=*/ 0);
+    const size_t file_size = statbuf.st_size;
+    void *addr = mmap(/*addr=*/ NULL, /*length=*/ file_size, PROT_READ | (dry_run ? 0 : PROT_WRITE), MAP_SHARED, fd, /*offset=*/ 0);
     if (addr == MAP_FAILED) {
         fprintf(stderr, "failed to mmap file: %s\n", strerror(errno));
         close(fd);
         return 1;
     }
 
+    if (file_size < sizeof(Elf64_Ehdr)) {
+        fprintf(stderr, "file too small to be an ELF64 binary\n");
+        munmap(addr, file_size);
+        close(fd);
+        return 1;
+    }
+
     // read ELF header, first thing in the file
     const Elf64_Ehdr *elf_header = addr;
-    const Elf64_Shdr *section_header = addr + elf_header->e_shoff + elf_header->e_shstrndx * sizeof(*section_header);
+    if (memcmp(elf_header->e_ident, ELFMAG, SELFMAG) != 0 ||
+        elf_header->e_ident[EI_CLASS] != ELFCLASS64) {
+        fprintf(stderr, "not a valid ELF64 file\n");
+        munmap(addr, file_size);
+        close(fd);
+        return 1;
+    }
+
+    if (elf_header->e_shentsize < sizeof(Elf64_Shdr) ||
+        elf_header->e_shoff > file_size ||
+        (uint64_t)elf_header->e_shnum * elf_header->e_shentsize > file_size - elf_header->e_shoff ||
+        elf_header->e_shstrndx >= elf_header->e_shnum) {
+        fprintf(stderr, "malformed ELF section header table\n");
+        munmap(addr, file_size);
+        close(fd);
+        return 1;
+    }
+
+    const Elf64_Shdr *section_header = (const Elf64_Shdr *)((const uint8_t *)addr + elf_header->e_shoff + (uint64_t)elf_header->e_shstrndx * elf_header->e_shentsize);
 
     // next, read the section, string data
-    const char *section_names = addr + section_header->sh_offset;
+    if (section_header->sh_offset > file_size ||
+        section_header->sh_size > file_size - section_header->sh_offset) {
+        fprintf(stderr, "malformed ELF section name string table\n");
+        munmap(addr, file_size);
+        close(fd);
+        return 1;
+    }
+    const char *section_names = (const char *)addr + section_header->sh_offset;
+    const size_t section_names_size = section_header->sh_size;
 
     // read all section headers
     for (idx = 0; idx < elf_header->e_shnum; ++idx) {
-        section_header = addr + elf_header->e_shoff + idx * sizeof(*section_header);
+        section_header = (const Elf64_Shdr *)((const uint8_t *)addr + elf_header->e_shoff + (uint64_t)idx * elf_header->e_shentsize);
         if (!(section_header->sh_flags & SHF_EXECINSTR)) {
             continue;
         }
 
+        if (section_header->sh_name >= section_names_size) {
+            fprintf(stderr, "section %u has out-of-bounds name offset\n", idx);
+            continue;
+        }
         const char *name = section_names + section_header->sh_name;
+        if (memchr(name, '\0', section_names_size - section_header->sh_name) == NULL) {
+            fprintf(stderr, "section %u name is not NUL-terminated\n", idx);
+            continue;
+        }
         printf("name: %s\n", name);
         if (strcmp(name, ".text") != 0) {
             continue;
         }
 
-        uint8_t *buf = addr + section_header->sh_offset;
+        if (section_header->sh_offset > file_size ||
+            section_header->sh_size > file_size - section_header->sh_offset) {
+            fprintf(stderr, "section %u has out-of-bounds data\n", idx);
+            continue;
+        }
+        uint8_t *buf = (uint8_t *)addr + section_header->sh_offset;
         rewrites += check_shifts(buf, section_header->sh_size, /*replace=*/ !dry_run);
     }
 
     printf("%d rewrites\n", rewrites);
 
-    munmap(addr, statbuf.st_size);
+    munmap(addr, file_size);
     close(fd);
     return 0;
 }
