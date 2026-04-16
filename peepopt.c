@@ -29,6 +29,8 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
     xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
     xed_decoded_inst_t xedd_old;
+    xed_decoded_inst_zero(&xedd_old);
+    xed_decoded_inst_set_mode(&xedd_old, mmode, stack_addr_width);
 
     for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
