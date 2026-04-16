@@ -23,14 +23,129 @@
 #include "peepopt.h"
 #include "xed/xed-interface.h"
 
+#define HISTORY_SIZE 8
+
+struct inst_history_entry {
+    xed_decoded_inst_t xedd;
+    size_t offset;
+};
+
+struct inst_history {
+    struct inst_history_entry entries[HISTORY_SIZE];
+    size_t count;
+    size_t head;
+};
+
+static void history_reset(struct inst_history *h)
+{
+    h->count = 0;
+    h->head = 0;
+}
+
+static void history_push(struct inst_history *h, const xed_decoded_inst_t *xedd, size_t offset)
+{
+    h->entries[h->head].xedd = *xedd;
+    h->entries[h->head].offset = offset;
+    h->head = (h->head + 1) % HISTORY_SIZE;
+    if (h->count < HISTORY_SIZE) {
+        h->count++;
+    }
+}
+
+static const struct inst_history_entry *history_at(const struct inst_history *h, size_t dist)
+{
+    if (dist == 0 || dist > h->count) {
+        return NULL;
+    }
+    size_t idx = (h->head + HISTORY_SIZE - dist) % HISTORY_SIZE;
+    return &h->entries[idx];
+}
+
+static bool reg_aliases_rcx(xed_reg_enum_t reg)
+{
+    return reg == XED_REG_RCX || reg == XED_REG_ECX || reg == XED_REG_CX ||
+           reg == XED_REG_CL  || reg == XED_REG_CH;
+}
+
+static bool action_reads(xed_operand_action_enum_t a)
+{
+    return a == XED_OPERAND_ACTION_R   || a == XED_OPERAND_ACTION_CR  ||
+           a == XED_OPERAND_ACTION_RW  || a == XED_OPERAND_ACTION_RCW ||
+           a == XED_OPERAND_ACTION_CRW;
+}
+
+static bool action_writes(xed_operand_action_enum_t a)
+{
+    return a == XED_OPERAND_ACTION_W   || a == XED_OPERAND_ACTION_CW  ||
+           a == XED_OPERAND_ACTION_RW  || a == XED_OPERAND_ACTION_RCW ||
+           a == XED_OPERAND_ACTION_CRW;
+}
+
+static void inst_touches_rcx(const xed_decoded_inst_t *xedd, bool *writes, bool *reads)
+{
+    *writes = false;
+    *reads = false;
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned int n = xed_inst_noperands(xi);
+    for (unsigned int i = 0; i < n; i++) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd, xed_operand_name(op));
+        if (!reg_aliases_rcx(reg)) {
+            continue;
+        }
+        xed_operand_action_enum_t a = xed_operand_rw(op);
+        if (action_writes(a)) *writes = true;
+        if (action_reads(a))  *reads = true;
+    }
+}
+
+// Scan history backward (most-recent first) for the nearest instruction that writes RCX/ECX.
+// Returns NULL if an intervening instruction reads RCX without writing it (which would break
+// the def-use chain from the writer to the shift's CL read), or if no writer is in the window.
+static const struct inst_history_entry *history_find_rcx_def(const struct inst_history *h)
+{
+    for (size_t dist = 1; dist <= h->count; dist++) {
+        const struct inst_history_entry *e = history_at(h, dist);
+        bool w = false, r = false;
+        inst_touches_rcx(&e->xedd, &w, &r);
+        if (w) {
+            return e;
+        }
+        if (r) {
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static bool is_basic_block_terminator(xed_iclass_enum_t iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_CALL_NEAR: case XED_ICLASS_CALL_FAR:
+    case XED_ICLASS_RET_NEAR:  case XED_ICLASS_RET_FAR:
+    case XED_ICLASS_JMP:       case XED_ICLASS_JMPABS:  case XED_ICLASS_JMP_FAR:
+    case XED_ICLASS_JB:        case XED_ICLASS_JBE:
+    case XED_ICLASS_JCXZ:      case XED_ICLASS_JECXZ:   case XED_ICLASS_JRCXZ:
+    case XED_ICLASS_JL:        case XED_ICLASS_JLE:
+    case XED_ICLASS_JNB:       case XED_ICLASS_JNBE:
+    case XED_ICLASS_JNL:       case XED_ICLASS_JNLE:
+    case XED_ICLASS_JNO:       case XED_ICLASS_JNP:
+    case XED_ICLASS_JNS:       case XED_ICLASS_JNZ:
+    case XED_ICLASS_JO:        case XED_ICLASS_JP:
+    case XED_ICLASS_JS:        case XED_ICLASS_JZ:
+        return true;
+    default:
+        return false;
+    }
+}
+
 int check_shifts(uint8_t *inst, size_t len, bool replace)
 {
     int count = 0;
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
     xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
-    xed_decoded_inst_t xedd_old;
-    xed_decoded_inst_zero(&xedd_old);
-    xed_decoded_inst_set_mode(&xedd_old, mmode, stack_addr_width);
+    struct inst_history history;
+    history_reset(&history);
 
     for (size_t offset = 0; offset < len;) {
         xed_decoded_inst_t xedd;
@@ -81,8 +196,22 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
             //     or %r8d, %edi
             //     shr %cl, %eax
             //     xor %ecx, %ecx
-            int oldiclass = xed_decoded_inst_get_iclass(&xedd_old);
+            const struct inst_history_entry *mov_entry = history_find_rcx_def(&history);
+            if (mov_entry == NULL) {
+                goto end;
+            }
+            const xed_decoded_inst_t *xedd_old = &mov_entry->xedd;
+            int oldiclass = xed_decoded_inst_get_iclass(xedd_old);
             if (oldiclass != XED_ICLASS_MOV) {
+                goto end;
+            }
+            // In-place rewrite positions SHLX at the MOV's offset and consumes
+            // the bytes through the end of the shift. We can only safely do this
+            // when nothing sits between the MOV and the shift.
+            if (mov_entry->offset + xed_decoded_inst_get_length(xedd_old) != offset) {
+                printf("MOV definer at offset %zu is %zu bytes before shift; in-place rewrite needs adjacency\n",
+                        mov_entry->offset,
+                        offset - mov_entry->offset - xed_decoded_inst_get_length(xedd_old));
                 goto end;
             }
 
@@ -95,7 +224,7 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
 
             // Previous MOV
             // TODO: possible to merge one other MOV due to three-operand instructions?
-            const xed_inst_t* xi = xed_decoded_inst_inst(&xedd_old);
+            const xed_inst_t* xi = xed_decoded_inst_inst(xedd_old);
             unsigned int noperands = xed_inst_noperands(xi);
             for (unsigned int i = 0; i < noperands; i++) {
                 const xed_operand_t *op = xed_inst_operand(xi, i);
@@ -104,7 +233,7 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                     goto end;
 
                 xed_operand_action_enum_t action = xed_operand_rw(op);
-                xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd_old, xed_operand_name(op));
+                xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd_old, xed_operand_name(op));
                 printf("mov   operand %u %s action register %s\n", i, xed_operand_action_enum_t2str(action), xed_reg_enum_t2str(reg));
 
                 if (action == XED_OPERAND_ACTION_R) {
@@ -319,7 +448,7 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                     goto end;
                 }
 
-                unsigned int old_len = xed_decoded_inst_get_length(&xedd) + xed_decoded_inst_get_length(&xedd_old);
+                unsigned int old_len = xed_decoded_inst_get_length(&xedd) + xed_decoded_inst_get_length(xedd_old);
                 printf("Replacement instruction is %u bytes and original instructions are %u bytes\n", new_len, old_len);
                 xed_decoded_inst_t xedd_tmp;
                 xed_decoded_inst_zero(&xedd_tmp);
@@ -346,7 +475,7 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                 // TODO: consider that shift distance may be > 31 for ECX or > 63 for RCX
 
                 if (replace) {
-                    uint8_t *addr = inst + offset - xed_decoded_inst_get_length(&xedd_old);
+                    uint8_t *addr = inst + mov_entry->offset;
                     memcpy(addr, new_bytes, new_len);
 
                     if (old_len - new_len > 0) {
@@ -363,7 +492,11 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
         }
 
 end:
-        xedd_old = xedd;
+        if (is_basic_block_terminator(xed_decoded_inst_get_iclass(&xedd))) {
+            history_reset(&history);
+        } else {
+            history_push(&history, &xedd, offset);
+        }
         offset += xed_decoded_inst_get_length(&xedd);
     }
 
