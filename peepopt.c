@@ -118,25 +118,85 @@ static const struct inst_history_entry *history_find_rcx_def(const struct inst_h
     return NULL;
 }
 
-static bool is_basic_block_terminator(xed_iclass_enum_t iclass)
+static bool is_basic_block_terminator(const xed_decoded_inst_t *xedd)
 {
-    switch (iclass) {
-    case XED_ICLASS_CALL_NEAR: case XED_ICLASS_CALL_FAR:
-    case XED_ICLASS_RET_NEAR:  case XED_ICLASS_RET_FAR:
-    case XED_ICLASS_JMP:       case XED_ICLASS_JMPABS:  case XED_ICLASS_JMP_FAR:
-    case XED_ICLASS_JB:        case XED_ICLASS_JBE:
-    case XED_ICLASS_JCXZ:      case XED_ICLASS_JECXZ:   case XED_ICLASS_JRCXZ:
-    case XED_ICLASS_JL:        case XED_ICLASS_JLE:
-    case XED_ICLASS_JNB:       case XED_ICLASS_JNBE:
-    case XED_ICLASS_JNL:       case XED_ICLASS_JNLE:
-    case XED_ICLASS_JNO:       case XED_ICLASS_JNP:
-    case XED_ICLASS_JNS:       case XED_ICLASS_JNZ:
-    case XED_ICLASS_JO:        case XED_ICLASS_JP:
-    case XED_ICLASS_JS:        case XED_ICLASS_JZ:
-        return true;
-    default:
+    xed_category_enum_t c = xed_decoded_inst_get_category(xedd);
+    return c == XED_CATEGORY_COND_BR || c == XED_CATEGORY_UNCOND_BR ||
+           c == XED_CATEGORY_CALL    || c == XED_CATEGORY_RET;
+}
+
+// Forward lookahead bails on conditional or unconditional branches only; CALL
+// and RET are handled as ECX/EFLAGS kills via the ABI (caller-saved regs).
+static bool is_branch_bailout(const xed_decoded_inst_t *xedd)
+{
+    xed_category_enum_t c = xed_decoded_inst_get_category(xedd);
+    return c == XED_CATEGORY_COND_BR || c == XED_CATEGORY_UNCOND_BR;
+}
+
+// `xor reg, reg` produces 0 regardless of the prior value of reg, so for
+// dataflow purposes it's a pure write even though XED reports operand 0 as RW.
+static bool is_zeroing_idiom_on_rcx(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_XOR) {
         return false;
     }
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    if (xed_inst_noperands(xi) < 2) {
+        return false;
+    }
+    const xed_operand_t *op0 = xed_inst_operand(xi, 0);
+    const xed_operand_t *op1 = xed_inst_operand(xi, 1);
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, xed_operand_name(op0));
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, xed_operand_name(op1));
+    return r0 == r1 && reg_aliases_rcx(r0);
+}
+
+static bool kills_ecx(const xed_decoded_inst_t *xedd)
+{
+    xed_category_enum_t c = xed_decoded_inst_get_category(xedd);
+    // ABI: caller-saved on SysV / clobbered across syscalls and on return.
+    if (c == XED_CATEGORY_CALL || c == XED_CATEGORY_RET) {
+        return true;
+    }
+    if (is_zeroing_idiom_on_rcx(xedd)) {
+        return true;
+    }
+    bool w = false, r = false;
+    inst_touches_rcx(xedd, &w, &r);
+    return w && !r;
+}
+
+static bool reads_ecx(const xed_decoded_inst_t *xedd)
+{
+    if (is_zeroing_idiom_on_rcx(xedd)) {
+        return false;
+    }
+    bool w = false, r = false;
+    inst_touches_rcx(xedd, &w, &r);
+    return r;
+}
+
+static bool kills_eflags(const xed_decoded_inst_t *xedd)
+{
+    // After RET we're in the caller; EFLAGS is not callee-preserved.
+    if (xed_decoded_inst_get_category(xedd) == XED_CATEGORY_RET) {
+        return true;
+    }
+    const xed_simple_flag_t *sflag = xed_decoded_inst_get_rflags_info(xedd);
+    if (sflag == NULL) {
+        return false;
+    }
+    return xed_flag_set_mask(xed_simple_flag_get_written_flag_set(sflag)) != 0 ||
+           xed_flag_set_mask(xed_simple_flag_get_undefined_flag_set(sflag)) != 0;
+}
+
+static bool reads_eflags(const xed_decoded_inst_t *xedd)
+{
+    const xed_simple_flag_t *sflag = xed_decoded_inst_get_rflags_info(xedd);
+    if (sflag == NULL) {
+        return false;
+    }
+    return xed_flag_set_mask(xed_simple_flag_get_read_flag_set(sflag)) != 0;
 }
 
 int check_shifts(uint8_t *inst, size_t len, bool replace)
@@ -314,98 +374,23 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                     printf("* %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd_new));
                 }
 
-                xi = xed_decoded_inst_inst(&xedd_new);
-                noperands = xed_inst_noperands(xi);
-                switch (xed_decoded_inst_get_iclass(&xedd_new)) {
-                case XED_ICLASS_CALL_NEAR:
-                case XED_ICLASS_CALL_FAR:
-                    printf("CALL clobbers ECX\n");
-                    ecx_written = true;
-                    break;
-                case XED_ICLASS_RET_NEAR:
-                case XED_ICLASS_RET_FAR:
-                    printf("RET clobbers ECX and EFLAGS\n");
-                    ecx_written = true;
-                    eflags_written = true;
-                    break;
-                case XED_ICLASS_XOR:
-                    if (noperands == 3) {
-                        // handle xor %ecx, %ecx
-                        xed_operand_action_enum_t actions[3];
-                        xed_reg_enum_t regs[3];
-                        for (unsigned int i = 0; i < noperands; ++i) {
-                            const xed_operand_t *op = xed_inst_operand(xi, i);
-                            actions[i] = xed_operand_rw(op);
-                            regs[i] = xed_decoded_inst_get_reg(&xedd_new, xed_operand_name(op));
-                        }
-                        if (actions[0] == XED_OPERAND_ACTION_RW && (regs[0] == XED_REG_ECX || regs[0] == XED_REG_RCX) &&
-                            actions[1] == XED_OPERAND_ACTION_R  && (regs[1] == XED_REG_ECX || regs[1] == XED_REG_RCX) &&
-                            actions[2] == XED_OPERAND_ACTION_W  && (regs[2] == XED_REG_EFLAGS || regs[2] == XED_REG_RFLAGS)) {
-                            printf("Zeroing idiom on ECX\n");
-                            ecx_written = true;
-                            eflags_written = true;
-                        }
-                    }
-                    break;
-                case XED_ICLASS_JB:
-                case XED_ICLASS_JBE:
-                case XED_ICLASS_JCXZ:
-                case XED_ICLASS_JECXZ:
-                case XED_ICLASS_JL:
-                case XED_ICLASS_JLE:
-                case XED_ICLASS_JMP:
-                case XED_ICLASS_JMPABS:
-                case XED_ICLASS_JMP_FAR:
-                case XED_ICLASS_JNB:
-                case XED_ICLASS_JNBE:
-                case XED_ICLASS_JNL:
-                case XED_ICLASS_JNLE:
-                case XED_ICLASS_JNO:
-                case XED_ICLASS_JNP:
-                case XED_ICLASS_JNS:
-                case XED_ICLASS_JNZ:
-                case XED_ICLASS_JO:
-                case XED_ICLASS_JP:
-                case XED_ICLASS_JRCXZ:
-                case XED_ICLASS_JS:
-                case XED_ICLASS_JZ:
-                    // Once control flow changes it is difficult to track liveness of ECX and EFLAGS
+                if (is_branch_bailout(&xedd_new)) {
                     printf("Branch, cannot replace\n");
                     goto end;
-                default:
-                    // ignore
-                    break;
                 }
-                // TODO: consider a pattern of neg %ecx
-
-                for (unsigned int i = 0; i < noperands; i++) {
-                    const xed_operand_t *op = xed_inst_operand(xi, i);
-                    xed_operand_action_enum_t action = xed_operand_rw(op);
-                    xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd_new, xed_operand_name(op));
-                    printf("???   operand %u action %s register %s\n", i, xed_operand_action_enum_t2str(action), xed_reg_enum_t2str(reg));
-
-                    if (action == XED_OPERAND_ACTION_R ||
-                        action == XED_OPERAND_ACTION_RW ||
-                        action == XED_OPERAND_ACTION_RCW ||
-                        action == XED_OPERAND_ACTION_CR) {
-                        if (!ecx_written && (reg == XED_REG_ECX || reg == XED_REG_RCX)) {
-                            printf("Reading from ECX, cannot replace\n");
-                            goto end;
-                        } else if (!eflags_written && (reg == XED_REG_FLAGS || reg == XED_REG_EFLAGS || reg == XED_REG_RFLAGS)) {
-                            printf("Reading from EFLAGS, cannot replace\n");
-                            goto end;
-                        }
-                    } else if (action == XED_OPERAND_ACTION_W) {
-                        // if writing to ECX then replacement may be possible
-                        if (reg == XED_REG_ECX || reg == XED_REG_RCX) {
-                            printf("Writing to ECX, replacement may be possible\n");
-                            ecx_written = true;
-                        }
-                        if (reg == XED_REG_FLAGS || reg == XED_REG_EFLAGS || reg == XED_REG_RFLAGS) {
-                            printf("Writing to EFLAGS, replacement may be possible\n");
-                            eflags_written = true;
-                        }
-                    }
+                if (!ecx_written && reads_ecx(&xedd_new)) {
+                    printf("Reading from ECX, cannot replace\n");
+                    goto end;
+                }
+                if (!eflags_written && reads_eflags(&xedd_new)) {
+                    printf("Reading from EFLAGS, cannot replace\n");
+                    goto end;
+                }
+                if (kills_ecx(&xedd_new)) {
+                    ecx_written = true;
+                }
+                if (kills_eflags(&xedd_new)) {
+                    eflags_written = true;
                 }
 
                 if (ecx_written && eflags_written) {
@@ -492,7 +477,7 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
         }
 
 end:
-        if (is_basic_block_terminator(xed_decoded_inst_get_iclass(&xedd))) {
+        if (is_basic_block_terminator(&xedd)) {
             history_reset(&history);
         } else {
             history_push(&history, &xedd, offset);
