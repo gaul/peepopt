@@ -25,6 +25,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "peepopt.h"
 #include "xed/xed-interface.h"
@@ -80,13 +81,15 @@ int main(int argc, char **argv)
     struct stat statbuf;
     int err = fstat(fd, &statbuf);
     if (err != 0) {
-        printf("failed to stat file: %s\n", strerror(errno));
+        fprintf(stderr, "failed to stat file: %s\n", strerror(errno));
+        close(fd);
         return 1;
     }
 
     void *addr = mmap(/*addr=*/ NULL, /*length=*/ statbuf.st_size, PROT_READ | (dry_run ? 0 : PROT_WRITE), MAP_SHARED, fd, /*offset=*/ 0);
-    if (addr == NULL) {
-        printf("failed to mmap file: %d\n", errno);
+    if (addr == MAP_FAILED) {
+        fprintf(stderr, "failed to mmap file: %s\n", strerror(errno));
+        close(fd);
         return 1;
     }
 
@@ -116,6 +119,8 @@ int main(int argc, char **argv)
 
     printf("%d rewrites\n", rewrites);
 
+    munmap(addr, statbuf.st_size);
+    close(fd);
     return 0;
 }
 
