@@ -296,15 +296,14 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
             if (oldiclass != XED_ICLASS_MOV) {
                 goto end;
             }
-            // In-place rewrite positions SHLX at the MOV's offset and consumes
-            // the bytes through the end of the shift. We can only safely do this
-            // when nothing sits between the MOV and the shift.
-            if (mov_entry->offset + xed_decoded_inst_get_length(xedd_old) != offset) {
-                printf("MOV definer at offset %zu is %zu bytes before shift; in-place rewrite needs adjacency\n",
-                        mov_entry->offset,
-                        offset - mov_entry->offset - xed_decoded_inst_get_length(xedd_old));
-                goto end;
-            }
+            // MOV1's offset vs. the shift determines the rewrite layout:
+            //   adjacent: [MOV1][SHIFT]           -> SHLX consumes MOV1+SHIFT
+            //   gap:      [MOV1][GAP][SHIFT]      -> only rewritable if the GAP
+            //                                        is exactly one MOV that
+            //                                        sets shift_dst (handled as
+            //                                        MOV2 absorption below).
+            size_t mov1_len_for_gap = xed_decoded_inst_get_length(xedd_old);
+            bool mov1_adjacent = (mov_entry->offset + mov1_len_for_gap == offset);
 
             printf("Examining MOV + shift pair\n");
 
@@ -387,20 +386,41 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                 mov_src = mov_src - XED_REG_RAX + XED_REG_EAX;
             }
 
-            // Optionally absorb a second MOV that supplies shift_dst's value. The gcc
-            // -O2 pattern `mov reg, shift_dst; mov src, %ecx; shl %cl, shift_dst` becomes
-            // `shlx %src, %reg, shift_dst` in a single 5-byte instruction, which fits
-            // whenever mov2_len + mov_len + shift_len >= 5. ECX is dead after the shift
-            // by the forward-lookahead invariant, and the intermediate MOV-to-ECX doesn't
-            // write shift_dst or mov2_src, so MOV2's source value still equals shift_dst
-            // at the original shift.
+            // Optionally absorb a second MOV that supplies shift_dst's value.
+            // Two layouts are supported:
+            //   Pattern A (MOV1 adjacent): [MOV2][MOV1][SHIFT]
+            //                              MOV2 candidate is at history distance 2.
+            //   Pattern B (MOV1 non-adjacent): [MOV1][MOV2][SHIFT]
+            //                              MOV2 candidate is at history distance 1
+            //                              and must exactly fill the MOV1<->SHIFT gap.
+            // Either folds into `shlx %count, %value, %shift_dst` (or the memory
+            // form). ECX is dead after the shift per the forward lookahead, and
+            // MOV1 is reg-to-reg so it can't alter memory or mov2_src.
             xed_reg_enum_t shlx_rm = shift_dst;
             size_t rewrite_offset = mov_entry->offset;
             const xed_decoded_inst_t *mov2_mem_source = NULL;
             if (!reg_aliases_rcx(shift_dst) &&
                 xed_get_largest_enclosing_register(mov_src) != xed_get_largest_enclosing_register(shift_dst)) {
-                const struct inst_history_entry *mov2_entry = history_at(&history, 2);
-                if (mov2_entry != NULL &&
+                const struct inst_history_entry *mov2_entry = NULL;
+                bool mov2_layout_ok = false;
+                if (mov1_adjacent) {
+                    mov2_entry = history_at(&history, 2);
+                    if (mov2_entry != NULL) {
+                        size_t mov2_end = mov2_entry->offset +
+                                          xed_decoded_inst_get_length(&mov2_entry->xedd);
+                        mov2_layout_ok = (mov2_end == mov_entry->offset);
+                    }
+                } else {
+                    mov2_entry = history_at(&history, 1);
+                    if (mov2_entry != NULL) {
+                        size_t mov2_end = mov2_entry->offset +
+                                          xed_decoded_inst_get_length(&mov2_entry->xedd);
+                        mov2_layout_ok =
+                                (mov2_entry->offset == mov_entry->offset + mov1_len_for_gap) &&
+                                (mov2_end == offset);
+                    }
+                }
+                if (mov2_layout_ok &&
                     xed_decoded_inst_get_iclass(&mov2_entry->xedd) == XED_ICLASS_MOV &&
                     xed_decoded_inst_get_immediate_width_bits(&mov2_entry->xedd) == 0) {
                     unsigned int nmem = xed_decoded_inst_number_of_memory_operands(&mov2_entry->xedd);
@@ -433,10 +453,6 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                             form_ok = false;
                         }
                     }
-                    // Require MOV2 to be adjacent to MOV1 so only MOV1 sits
-                    // between MOV2 and the shift; MOV1 is reg-to-reg and thus
-                    // cannot alter memory or mov2_src_reg.
-                    size_t mov2_end = mov2_entry->offset + xed_decoded_inst_get_length(&mov2_entry->xedd);
                     bool addr_ok = true;
                     if (nmem == 1) {
                         // SHLX has a different encoded length than MOV2, so a
@@ -449,7 +465,6 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                     if (form_ok &&
                         addr_ok &&
                         mov2_dst == shift_dst &&
-                        mov2_end == mov_entry->offset &&
                         (nmem == 1 ||
                          (mov2_src_reg != XED_REG_INVALID && !reg_aliases_rcx(mov2_src_reg)))) {
                         if (nmem == 1) {
@@ -460,9 +475,21 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                                     xed_reg_enum_t2str(mov2_dst), xed_reg_enum_t2str(mov2_src_reg));
                             shlx_rm = mov2_src_reg;
                         }
-                        rewrite_offset = mov2_entry->offset;
+                        // Rewrite starts at the earliest absorbed instruction.
+                        if (mov2_entry->offset < rewrite_offset) {
+                            rewrite_offset = mov2_entry->offset;
+                        }
                     }
                 }
+            }
+
+            // Non-adjacent MOV1 is only safe when the intervening gap was
+            // entirely filled by an absorbable MOV2.
+            if (!mov1_adjacent && shlx_rm == shift_dst && mov2_mem_source == NULL) {
+                printf("MOV1 at offset %zu is %zu bytes before shift and gap is not an absorbable MOV2; skipping\n",
+                        mov_entry->offset,
+                        offset - mov_entry->offset - mov1_len_for_gap);
+                goto end;
             }
 
             printf("Higher confidence\n");

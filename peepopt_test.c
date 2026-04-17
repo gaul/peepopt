@@ -376,6 +376,51 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ Pattern B: MOV1 before MOV2 (reversed gcc order) ------ */
+    // `mov %r8d,%ecx; mov %edi,%eax; shl %cl,%eax` folds into
+    // `shlx %r8d,%edi,%eax` even though MOV1 is not adjacent to the shift.
+    {
+        uint8_t bytes[] = {
+            0x44, 0x89, 0xC1,   // movl %r8d,%ecx    (MOV1)
+            0x89, 0xF8,         // movl %edi,%eax    (MOV2)
+            0xD3, 0xE0,         // sall %cl,%eax
+            0xC3,               // ret
+        };
+        uint8_t expect[] = {
+            0xC4, 0xE2, 0x39, 0xF7, 0xC7,   // shlxl %r8d,%edi,%eax
+            0x66, 0x90,                     // 2-byte NOP
+            0xC3,
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
+    /* ------ Pattern B with memory-source MOV2 ------ */
+    {
+        uint8_t bytes[] = {
+            0x44, 0x89, 0xC1,   // movl %r8d,%ecx    (MOV1)
+            0x8B, 0x06,         // movl (%rsi),%eax  (MOV2 mem source)
+            0xD3, 0xE0,         // sall %cl,%eax
+            0xC3,
+        };
+        uint8_t expect[] = {
+            0xC4, 0xE2, 0x39, 0xF7, 0x06,   // shlxl %r8d,(%rsi),%eax
+            0x66, 0x90,                     // 2-byte NOP
+            0xC3,
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
+    /* ------ Non-adjacent MOV1 with unrecognized gap must bail ------ */
+    // `mov %r8d,%ecx; xor %edi,%edi; shl %cl,%eax` — intervening XOR is not
+    // a MOV that sets shift_dst and cannot be absorbed. Must refuse rewrite.
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,   // movl %r8d,%ecx
+        0x31, 0xFF,         // xor %edi,%edi
+        0xD3, 0xE0,         // sall %cl,%eax
+        0xC3
+    );
+
     /* ------ 32-bit shift with 64-bit MOV1 source: demote to 32-bit count ------ */
     // `mov %r8,%rcx; shl %cl,%eax; ret` has mov_src=R8 (64-bit) but shift_dst
     // is EAX (32-bit). Previously this hit GENERAL_ERROR in the encoder; now
