@@ -344,10 +344,11 @@ int main(int argc, char *argv[])
         check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
     }
 
-    /* ------ RIP-relative MOV2 must NOT be absorbed (displacement would drift) ------ */
-    // MOV2 is `mov 0x100(%rip),%eax` (7 bytes). Absorption would place SHLX at
-    // MOV2's offset; SHLX's different length makes the RIP-relative target
-    // land on a different byte. Fall back to MOV1+shift rewrite only.
+    /* ------ RIP-relative MOV2 absorbed with displacement adjusted ------ */
+    // Original: `mov 0x100(%rip), %eax` at offset 0 (6 bytes, next-inst=6,
+    // target = 6 + 0x100 = 0x106).
+    // SHLX lands at offset 0 with length 9, so new disp = 0x106 - 0 - 9 = 0xFD,
+    // preserving the original target address.
     {
         uint8_t bytes[] = {
             0x8B, 0x05, 0x00, 0x01, 0x00, 0x00,  // mov 0x100(%rip),%eax
@@ -356,8 +357,8 @@ int main(int argc, char *argv[])
             0xC3,                                // ret
         };
         uint8_t expect[] = {
-            0x8B, 0x05, 0x00, 0x01, 0x00, 0x00,  // MOV2 preserved
-            0xC4, 0xE2, 0x39, 0xF7, 0xC0,        // shlxl %r8d,%eax,%eax (MOV1+SHL only)
+            0xC4, 0xE2, 0x39, 0xF7, 0x05, 0xFD, 0x00, 0x00, 0x00,  // shlxl %r8d,0xFD(%rip),%eax
+            0x66, 0x90,                                            // 2-byte NOP
             0xC3,
         };
         check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));

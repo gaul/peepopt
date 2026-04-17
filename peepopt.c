@@ -491,6 +491,8 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             xed_reg_enum_t shlx_rm = shift_dst;
             size_t rewrite_offset = mov_entry->offset;
             const xed_decoded_inst_t *mov2_mem_source = NULL;
+            size_t mov2_source_offset = 0;
+            size_t mov2_source_len = 0;
             if (!reg_aliases_rcx(shift_dst) &&
                 xed_get_largest_enclosing_register(mov_src) != xed_get_largest_enclosing_register(shift_dst)) {
                 const struct inst_history_entry *mov2_entry = NULL;
@@ -545,23 +547,15 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                             form_ok = false;
                         }
                     }
-                    bool addr_ok = true;
-                    if (nmem == 1) {
-                        // SHLX has a different encoded length than MOV2, so a
-                        // RIP-relative displacement wouldn't target the same byte.
-                        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&mov2_entry->xedd, 0);
-                        if (base == XED_REG_RIP || base == XED_REG_EIP) {
-                            addr_ok = false;
-                        }
-                    }
                     if (form_ok &&
-                        addr_ok &&
                         mov2_dst == shift_dst &&
                         (nmem == 1 ||
                          (mov2_src_reg != XED_REG_INVALID && !reg_aliases_rcx(mov2_src_reg)))) {
                         if (nmem == 1) {
                             printf("Absorbing MOV2 with memory source into SHLX\n");
                             mov2_mem_source = &mov2_entry->xedd;
+                            mov2_source_offset = mov2_entry->offset;
+                            mov2_source_len = xed_decoded_inst_get_length(&mov2_entry->xedd);
                         } else {
                             printf("Absorbing MOV that sets shift_dst (%s := %s)\n",
                                     xed_reg_enum_t2str(mov2_dst), xed_reg_enum_t2str(mov2_src_reg));
@@ -660,13 +654,27 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 if (mov2_mem_source != NULL) {
                     xed_uint_t mem_width_bits =
                             xed_decoded_inst_get_memory_operand_length(mov2_mem_source, 0) * 8;
+                    xed_reg_enum_t mem_base = xed_decoded_inst_get_base_reg(mov2_mem_source, 0);
+                    int64_t disp = xed_decoded_inst_get_memory_displacement(mov2_mem_source, 0);
+                    xed_uint_t disp_width_bits = xed_decoded_inst_get_memory_displacement_width_bits(mov2_mem_source, 0);
+                    // RIP-relative loads encode a PC-relative displacement, and
+                    // SHLX at rewrite_offset lands at a different byte than MOV2
+                    // did. Shift the displacement by the address delta so the
+                    // target stays the same. SHLX with RIP-relative memory is
+                    // always 9 bytes (3-byte VEX + F7 + ModR/M + disp32).
+                    if (mem_base == XED_REG_RIP || mem_base == XED_REG_EIP) {
+                        static const int shlx_rip_len = 9;
+                        int64_t target = (int64_t)mov2_source_offset +
+                                         (int64_t)mov2_source_len + disp;
+                        disp = target - (int64_t)rewrite_offset - shlx_rip_len;
+                        disp_width_bits = 32;
+                    }
                     op_rm = xed_mem_gbisd(
                             xed_decoded_inst_get_seg_reg(mov2_mem_source, 0),
-                            xed_decoded_inst_get_base_reg(mov2_mem_source, 0),
+                            mem_base,
                             xed_decoded_inst_get_index_reg(mov2_mem_source, 0),
                             xed_decoded_inst_get_scale(mov2_mem_source, 0),
-                            xed_disp(xed_decoded_inst_get_memory_displacement(mov2_mem_source, 0),
-                                     xed_decoded_inst_get_memory_displacement_width_bits(mov2_mem_source, 0)),
+                            xed_disp(disp, disp_width_bits),
                             mem_width_bits);
                 } else {
                     op_rm = xed_reg(shlx_rm);
