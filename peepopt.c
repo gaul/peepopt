@@ -230,7 +230,74 @@ static uint32_t read_rflags_mask(const xed_decoded_inst_t *xedd)
     return xed_flag_set_mask(xed_simple_flag_get_read_flag_set(sflag));
 }
 
+static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
+                              const uint8_t *branch_targets);
+
+// Scan the section for PC-relative branch targets and record each target byte
+// offset in the bitmap. Used before rewriting to refuse any rewrite whose
+// interior bytes (i.e., anything other than the rewrite's first byte) is a
+// known jump destination.
+//
+// This covers direct Jcc/JMP/CALL rel. Indirect branches and jump-table
+// targets in .rodata are not detected — those remain a residual risk.
+static void collect_branch_targets(const uint8_t *inst, size_t len,
+                                    uint8_t *targets)
+{
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    for (size_t off = 0; off < len;) {
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        if (xed_decode(&xedd, inst + off, len - off) != XED_ERROR_NONE) {
+            return;
+        }
+        xed_category_enum_t cat = xed_decoded_inst_get_category(&xedd);
+        if (xed_decoded_inst_get_branch_displacement_width(&xedd) > 0 &&
+            (cat == XED_CATEGORY_COND_BR ||
+             cat == XED_CATEGORY_UNCOND_BR ||
+             cat == XED_CATEGORY_CALL)) {
+            xed_int32_t disp = xed_decoded_inst_get_branch_displacement(&xedd);
+            xed_uint_t inst_len = xed_decoded_inst_get_length(&xedd);
+            int64_t target = (int64_t)off + (int64_t)inst_len + (int64_t)disp;
+            if (target >= 0 && (size_t)target < len) {
+                size_t t = (size_t)target;
+                targets[t / 8] |= (uint8_t)(1u << (t % 8));
+            }
+        }
+        off += xed_decoded_inst_get_length(&xedd);
+    }
+}
+
+// Returns true if any byte strictly between `lo` and `hi` (exclusive-exclusive
+// on the low side, exclusive on the high side means [lo+1, hi)) is marked as
+// a branch target. The rewrite keeps the byte at `lo` (SHLX's first byte) so
+// jumps to `lo` stay correct; any interior byte gets repurposed.
+static bool target_in_interior(const uint8_t *targets, size_t lo, size_t hi)
+{
+    for (size_t t = lo + 1; t < hi; t++) {
+        if (targets[t / 8] & (uint8_t)(1u << (t % 8))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int check_shifts(uint8_t *inst, size_t len, bool replace)
+{
+    size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
+    uint8_t *targets = calloc(bitmap_bytes, 1);
+    if (targets == NULL) {
+        return -1;
+    }
+    collect_branch_targets(inst, len, targets);
+    int result = check_shifts_impl(inst, len, replace, targets);
+    free(targets);
+    return result;
+}
+
+static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
+                              const uint8_t *branch_targets)
 {
     int count = 0;
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
@@ -616,12 +683,17 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                 if (ok) {
                     printf("R %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd_tmp));
                 }
-                if (new_len <= old_len) {
-                    ++count;
-                } else {
+                if (new_len > old_len) {
                     printf("Cannot replace instructions since replacement is too large\n");
                     goto end;
                 }
+                if (target_in_interior(branch_targets, rewrite_offset,
+                                       offset + xed_decoded_inst_get_length(&xedd))) {
+                    printf("Branch target inside rewrite range [%zu, %zu); skipping\n",
+                            rewrite_offset, offset + xed_decoded_inst_get_length(&xedd));
+                    goto end;
+                }
+                ++count;
 
                 // TODO: consider that shift distance may be > 31 for ECX or > 63 for RCX
 

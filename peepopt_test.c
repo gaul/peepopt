@@ -376,6 +376,28 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ Rewrite must refuse when a branch targets an interior byte ------ */
+    // `jmp +3` at offset 0 targets offset 5 (the SHIFT). Absorbing MOV1+SHIFT
+    // into SHLX would place offset 5 inside the SHLX encoding.
+    CHECK_BYTES(
+        0,
+        0xEB, 0x03,              // jmp +3   (target = offset 5 = start of shift)
+        0x44, 0x89, 0xC1,        // mov %r8d,%ecx   (MOV1, offset 2)
+        0xD3, 0xE0,              // shl %cl,%eax    (offset 5, jmp target)
+        0xC3                     // ret
+    );
+
+    /* ------ Jump to the rewrite's first byte IS safe (SHLX starts there) ------ */
+    // `jmp +0` at offset 0 targets offset 2 (MOV1's start). After rewrite,
+    // SHLX sits at offset 2, so the jump still lands on a valid instruction.
+    CHECK_BYTES(
+        1,
+        0xEB, 0x00,              // jmp +0  (target = offset 2 = MOV1's start)
+        0x44, 0x89, 0xC1,        // mov %r8d,%ecx    (MOV1, offset 2)
+        0xD3, 0xE0,              // shl %cl,%eax     (offset 5)
+        0xC3
+    );
+
     /* ------ Pattern B: MOV1 before MOV2 (reversed gcc order) ------ */
     // `mov %r8d,%ecx; mov %edi,%eax; shl %cl,%eax` folds into
     // `shlx %r8d,%edi,%eax` even though MOV1 is not adjacent to the shift.
