@@ -73,9 +73,9 @@ int main(int argc, char *argv[])
         0x89, 0xF1,        // movl %esi,%ecx
         0xD3, 0xE0         // sall %cl,%eax
     );
-    // Same plus RET: replacement (5 bytes) is larger than original (4 bytes), skip
+    // Same plus RET: SHLX absorbs both MOVs (6-byte footprint fits the 5-byte SHLX)
     CHECK_BYTES(
-        0,
+        1,
         0x89, 0xF8,        // movl %edi,%eax
         0x89, 0xF1,        // movl %esi,%ecx
         0xD3, 0xE0,        // sall %cl,%eax
@@ -289,12 +289,54 @@ int main(int argc, char *argv[])
             0xC3,              // ret
         };
         uint8_t expect[] = {
-            0x89, 0xF8,                        // movl %edi,%eax (untouched)
-            0xC4, 0xE2, 0x39, 0xF7, 0xC0,      // shlxl %r8d,%eax,%eax
+            0xC4, 0xE2, 0x39, 0xF7, 0xC7,      // shlxl %r8d,%edi,%eax (MOV2 absorbed)
+            0x66, 0x90,                        // 2-byte NOP padding
             0xC3,                              // ret (untouched)
         };
         check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
     }
+
+    /* ------ replace=true: absorption of a 2-byte MOV2 (gcc -O2 pattern) ------ */
+    {
+        uint8_t bytes[] = {
+            0x89, 0xF8,        // movl %edi,%eax      (MOV2: sets EAX)
+            0x89, 0xF1,        // movl %esi,%ecx      (MOV1: sets ECX)
+            0xD3, 0xE0,        // sall %cl,%eax
+            0xC3,              // ret
+        };
+        uint8_t expect[] = {
+            0xC4, 0xE2, 0x49, 0xF7, 0xC7,      // shlxl %esi,%edi,%eax
+            0x90,                              // 1-byte NOP padding
+            0xC3,                              // ret (untouched)
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
+    /* ------ MOV2 absorption must not fire when shift_dst aliases RCX ------ */
+    // `mov src1, %eax; mov src2, %ecx; shl %cl, %ecx` — here shift_dst is ECX so
+    // MOV1 overwrites shift_dst before the shift; absorbing MOV2 would shift a
+    // stale value. The current rewrite also cannot run (shift_dst==ECX violates
+    // shift_src==CL / shift_dst!=ECX pairing), so this is a belt-and-braces check.
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,        // movl %edi,%eax
+        0x89, 0xF1,        // movl %esi,%ecx
+        0xD3, 0xE1,        // shll %cl,%ecx
+        0xC3
+    );
+
+    /* ------ MOV2 absorption must not fire when MOV1's source aliases shift_dst ------ */
+    // `mov %eax, %eax; mov %eax, %ecx; shl %cl, %eax` — mov1_src (EAX) aliases
+    // shift_dst (EAX). Absorbing MOV2 would use its source for SHLX's rm, but
+    // SHLX also reads count from mov1_src (shift_dst) which would now see the
+    // pre-MOV2 value.
+    CHECK_BYTES(
+        0,
+        0x89, 0xC0,        // movl %eax,%eax  (MOV2)
+        0x89, 0xC1,        // movl %eax,%ecx  (MOV1)
+        0xD3, 0xE0,        // shll %cl,%eax
+        0xC3
+    );
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
