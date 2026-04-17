@@ -133,8 +133,17 @@ static bool is_branch_bailout(const xed_decoded_inst_t *xedd)
     return c == XED_CATEGORY_COND_BR || c == XED_CATEGORY_UNCOND_BR;
 }
 
+// Full-width ECX or RCX. Sub-registers (CL/CH/CX) only overwrite part of the
+// register and can't be treated as a kill of MOV1's contribution.
+static bool reg_is_full_ecx(xed_reg_enum_t reg)
+{
+    return reg == XED_REG_ECX || reg == XED_REG_RCX;
+}
+
 // `xor reg, reg` produces 0 regardless of the prior value of reg, so for
 // dataflow purposes it's a pure write even though XED reports operand 0 as RW.
+// Only full-width ECX/RCX zeroing counts; `xor %cl, %cl` leaves the upper bits
+// of ECX untouched and does not kill MOV1's value.
 static bool is_zeroing_idiom_on_rcx(const xed_decoded_inst_t *xedd)
 {
     if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_XOR) {
@@ -148,7 +157,7 @@ static bool is_zeroing_idiom_on_rcx(const xed_decoded_inst_t *xedd)
     const xed_operand_t *op1 = xed_inst_operand(xi, 1);
     xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd, xed_operand_name(op0));
     xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd, xed_operand_name(op1));
-    return r0 == r1 && reg_aliases_rcx(r0);
+    return r0 == r1 && reg_is_full_ecx(r0);
 }
 
 static bool kills_ecx(const xed_decoded_inst_t *xedd)
@@ -161,9 +170,27 @@ static bool kills_ecx(const xed_decoded_inst_t *xedd)
     if (is_zeroing_idiom_on_rcx(xedd)) {
         return true;
     }
-    bool w = false, r = false;
-    inst_touches_rcx(xedd, &w, &r);
-    return w && !r;
+    // A pure write to the full ECX or RCX (not a sub-register). Partial writes
+    // like `mov $1, %cl` or `mov ..., %cx` leave the upper bits observable.
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned int n = xed_inst_noperands(xi);
+    bool full_write = false;
+    bool any_read = false;
+    for (unsigned int i = 0; i < n; i++) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd, xed_operand_name(op));
+        if (!reg_aliases_rcx(reg)) {
+            continue;
+        }
+        xed_operand_action_enum_t a = xed_operand_rw(op);
+        if (action_reads(a)) {
+            any_read = true;
+        }
+        if (action_writes(a) && reg_is_full_ecx(reg)) {
+            full_write = true;
+        }
+    }
+    return full_write && !any_read;
 }
 
 static bool reads_ecx(const xed_decoded_inst_t *xedd)
@@ -176,27 +203,31 @@ static bool reads_ecx(const xed_decoded_inst_t *xedd)
     return r;
 }
 
-static bool kills_eflags(const xed_decoded_inst_t *xedd)
+// Mask of rflags bits this instruction definitely clobbers (written or
+// undefined). CALL and RET clobber everything via ABI: after RET we're in the
+// caller, and a CALL may return with any rflag (SysV leaves flags
+// caller-responsibility).
+static uint32_t written_rflags_mask(const xed_decoded_inst_t *xedd)
 {
-    // After RET we're in the caller; EFLAGS is not callee-preserved.
-    if (xed_decoded_inst_get_category(xedd) == XED_CATEGORY_RET) {
-        return true;
+    xed_category_enum_t c = xed_decoded_inst_get_category(xedd);
+    if (c == XED_CATEGORY_CALL || c == XED_CATEGORY_RET) {
+        return UINT32_MAX;
     }
     const xed_simple_flag_t *sflag = xed_decoded_inst_get_rflags_info(xedd);
     if (sflag == NULL) {
-        return false;
+        return 0;
     }
-    return xed_flag_set_mask(xed_simple_flag_get_written_flag_set(sflag)) != 0 ||
-           xed_flag_set_mask(xed_simple_flag_get_undefined_flag_set(sflag)) != 0;
+    return xed_flag_set_mask(xed_simple_flag_get_written_flag_set(sflag)) |
+           xed_flag_set_mask(xed_simple_flag_get_undefined_flag_set(sflag));
 }
 
-static bool reads_eflags(const xed_decoded_inst_t *xedd)
+static uint32_t read_rflags_mask(const xed_decoded_inst_t *xedd)
 {
     const xed_simple_flag_t *sflag = xed_decoded_inst_get_rflags_info(xedd);
     if (sflag == NULL) {
-        return false;
+        return 0;
     }
-    return xed_flag_set_mask(xed_simple_flag_get_read_flag_set(sflag)) != 0;
+    return xed_flag_set_mask(xed_simple_flag_get_read_flag_set(sflag));
 }
 
 int check_shifts(uint8_t *inst, size_t len, bool replace)
@@ -406,9 +437,13 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
 
             printf("Higher confidence\n");
 
-            // Look ahead at subsequent instructions to see if both RCX and RFLAGS are overwritten.
+            // Look ahead to verify ECX is dead and every rflag SHL writes is
+            // overwritten before any instruction reads it. SHLX leaves rflags
+            // unchanged, so a read of any SHL-written flag before that flag is
+            // clobbered would observe different values in the rewritten code.
             bool ecx_written = false;
-            bool eflags_written = false;
+            uint32_t shift_flags_mask = written_rflags_mask(&xedd);
+            uint32_t killed_flags_mask = 0;
 
             size_t new_offset = offset + xed_decoded_inst_get_length(&xedd);
             for (int i = 0; i < 16 && new_offset < len; ++i) {
@@ -437,24 +472,24 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                     printf("Reading from ECX, cannot replace\n");
                     goto end;
                 }
-                if (!eflags_written && reads_eflags(&xedd_new)) {
-                    printf("Reading from EFLAGS, cannot replace\n");
+                uint32_t read_mask = read_rflags_mask(&xedd_new);
+                if ((read_mask & shift_flags_mask & ~killed_flags_mask) != 0) {
+                    printf("Reading a shift-written EFLAGS bit, cannot replace\n");
                     goto end;
                 }
                 if (kills_ecx(&xedd_new)) {
                     ecx_written = true;
                 }
-                if (kills_eflags(&xedd_new)) {
-                    eflags_written = true;
-                }
+                killed_flags_mask |= written_rflags_mask(&xedd_new);
 
-                if (ecx_written && eflags_written) {
+                if (ecx_written && (shift_flags_mask & ~killed_flags_mask) == 0) {
                     break;
                 }
 
                 new_offset += xed_decoded_inst_get_length(&xedd_new);
             }
 
+            bool eflags_written = (shift_flags_mask & ~killed_flags_mask) == 0;
             if (ecx_written && eflags_written) {
                 // assemble replacement instruction
                 printf("Highest confidence that replacement is possible\n");

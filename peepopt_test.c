@@ -325,6 +325,61 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ Soundness: partial-CL write is NOT a full ECX kill ------ */
+    // Previously `mov $1, %cl` counted as kills_ecx, but it leaves the upper
+    // 24 bits of ECX holding MOV1's value. A subsequent read of %ecx would see
+    // a different upper half under rewrite than under the original.
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,              // movl %edi,%eax
+        0x44, 0x89, 0xC1,        // movl %r8d,%ecx
+        0xD3, 0xE0,              // sall %cl,%eax
+        0xB1, 0x01,              // mov $1,%cl       (partial, must NOT kill)
+        0x89, 0xCA,              // mov %ecx,%edx    (reads ECX — must bail)
+        0x31, 0xC9,              // xor %ecx,%ecx
+        0xC3                     // ret
+    );
+
+    /* ------ Soundness: `xor %cl,%cl` is NOT a full zeroing kill ------ */
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0x30, 0xC9,              // xor %cl,%cl      (partial zeroing)
+        0x89, 0xCA,              // mov %ecx,%edx    (reads ECX — must bail)
+        0x31, 0xC9,
+        0xC3
+    );
+
+    /* ------ Soundness: partial flag write does NOT kill all SHL-written flags ------ */
+    // `stc` writes only CF. SHL writes CF, OF, SF, ZF, PF. A `setz` read of ZF
+    // must bail since ZF is still unkilled from the shift's perspective.
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0xF9,                    // stc               (writes only CF)
+        0x0F, 0x94, 0xC2,        // setz %dl          (reads ZF — must bail)
+        0x31, 0xC9,
+        0xC3
+    );
+
+    /* ------ Soundness: CALL now kills all EFLAGS (SysV ABI) ------ */
+    // Previously CALL was treated as an ECX kill only, so a post-call read of
+    // any flag would reject. With the fix, CALL clears the flag mask and the
+    // subsequent setz read is safe (flags are clobbered by the callee anyway).
+    CHECK_BYTES(
+        1,
+        0x89, 0xF8,
+        0x44, 0x89, 0xC1,
+        0xD3, 0xE0,
+        0xE8, 0x00, 0x00, 0x00, 0x00,  // call rel32 (kills ECX + all flags)
+        0x0F, 0x94, 0xC2,              // setz %dl   (reads ZF — OK after CALL)
+        0xC3
+    );
+
     /* ------ MOV2 absorption must not fire when MOV1's source aliases shift_dst ------ */
     // `mov %eax, %eax; mov %eax, %ecx; shl %cl, %eax` — mov1_src (EAX) aliases
     // shift_dst (EAX). Absorbing MOV2 would use its source for SHLX's rm, but
