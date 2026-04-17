@@ -443,6 +443,51 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ MOVZX as MOV1 with 8-bit source ------ */
+    // `movzbl %dl, %ecx; shl %cl, %eax; ret` folds into `shlx %edx, ..., %eax`
+    // because SHLX reads only the low 5 bits of %edx, which are the low 5 bits
+    // of %dl — the same bits SHL would have read via %cl after zero-extension.
+    CHECK_BYTES(
+        1,
+        0x0F, 0xB6, 0xCA,        // movzbl %dl,%ecx
+        0xD3, 0xE0,              // shl %cl,%eax
+        0xC3
+    );
+
+    /* ------ MOVSX as MOV1 with 8-bit source ------ */
+    CHECK_BYTES(
+        1,
+        0x0F, 0xBE, 0xCA,        // movsbl %dl,%ecx
+        0xD3, 0xE0,              // shl %cl,%eax
+        0xC3
+    );
+
+    /* ------ MOVZX 16->32 as MOV1 ------ */
+    CHECK_BYTES(
+        1,
+        0x0F, 0xB7, 0xCA,        // movzwl %dx,%ecx
+        0xD3, 0xE0,              // shl %cl,%eax
+        0xC3
+    );
+
+    /* ------ MOVSXD 32->64 as MOV1 for a 64-bit shift ------ */
+    CHECK_BYTES(
+        1,
+        0x48, 0x63, 0xCA,        // movsxd %edx,%rcx
+        0x48, 0xD3, 0xE0,        // shl %cl,%rax
+        0xC3
+    );
+
+    /* ------ MOVZX from high-byte (AH) source must be rejected ------ */
+    // AH's bits sit at [15:8] of RAX, not [7:0]; SHLX reading %eax's low bits
+    // would see AL's value, not AH's. Refuse the rewrite.
+    CHECK_BYTES(
+        0,
+        0x0F, 0xB6, 0xCC,        // movzbl %ah,%ecx
+        0xD3, 0xE0,              // shl %cl,%eax
+        0xC3
+    );
+
     /* ------ 32-bit shift with 64-bit MOV1 source: demote to 32-bit count ------ */
     // `mov %r8,%rcx; shl %cl,%eax; ret` has mov_src=R8 (64-bit) but shift_dst
     // is EAX (32-bit). Previously this hit GENERAL_ERROR in the encoder; now

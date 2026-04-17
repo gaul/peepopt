@@ -360,7 +360,16 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             }
             const xed_decoded_inst_t *xedd_old = &mov_entry->xedd;
             int oldiclass = xed_decoded_inst_get_iclass(xedd_old);
-            if (oldiclass != XED_ICLASS_MOV) {
+            // MOVZX/MOVSX write the full ECX/RCX zero- or sign-extended from a
+            // narrower source. The shift reads CL (= the low byte of the source
+            // in both cases), so SHLX can read directly from the source register
+            // -- the upper bits of the count register don't matter because SHLX
+            // masks to 5 or 6 bits, and those low bits are identical whether
+            // the extension is zero or sign.
+            if (oldiclass != XED_ICLASS_MOV &&
+                oldiclass != XED_ICLASS_MOVZX &&
+                oldiclass != XED_ICLASS_MOVSX &&
+                oldiclass != XED_ICLASS_MOVSXD) {
                 goto end;
             }
             // MOV1's offset vs. the shift determines the rewrite layout:
@@ -440,17 +449,33 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             }
 
             // SHLX requires the count register's width to match the effective
-            // operand width. x86 shifts mask the count to 5 bits (32-bit) or
-            // 6 bits (64-bit), and those low bits alias across the register's
-            // widths, so either direction is safe. The GPR enum is laid out
-            // so that RXX - EXX is a constant across both the legacy (AX/CX/...)
-            // and extended (R8..R15) ranges.
+            // operand width (32 or 64). x86 shifts mask the count to 5 or 6
+            // bits, and those low bits alias across every width of a given
+            // GPR, so we can substitute the 32- or 64-bit parent register.
+            //
+            // High-byte registers (AH/BH/CH/DH) are the exception: their bits
+            // live in bits [15:8] of the parent, not [7:0], so the low 5 bits
+            // of the parent aren't the low 5 bits of AH/BH/CH/DH. Refuse them.
+            if (mov_src == XED_REG_AH || mov_src == XED_REG_BH ||
+                mov_src == XED_REG_CH || mov_src == XED_REG_DH) {
+                printf("MOV1 source is a high-byte register; cannot use in SHLX\n");
+                goto end;
+            }
             unsigned int shift_width = xed_get_register_width_bits(shift_dst);
             unsigned int mov_src_width = xed_get_register_width_bits(mov_src);
-            if (shift_width == 64 && mov_src_width == 32) {
-                mov_src = mov_src - XED_REG_EAX + XED_REG_RAX;
-            } else if (shift_width == 32 && mov_src_width == 64) {
-                mov_src = mov_src - XED_REG_RAX + XED_REG_EAX;
+            if (mov_src_width != shift_width) {
+                xed_reg_enum_t parent64 = xed_get_largest_enclosing_register(mov_src);
+                if (parent64 == XED_REG_INVALID) {
+                    goto end;
+                }
+                if (shift_width == 64) {
+                    mov_src = parent64;
+                } else {
+                    // Demote 64 -> 32 via enum-offset arithmetic. The GPR enum
+                    // is laid out so RXX - EXX is the same constant across the
+                    // legacy and R8..R15 ranges.
+                    mov_src = parent64 - XED_REG_RAX + XED_REG_EAX;
+                }
             }
 
             // Optionally absorb a second MOV that supplies shift_dst's value.
