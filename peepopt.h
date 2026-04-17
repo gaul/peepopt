@@ -21,5 +21,6 @@
 #include <unistd.h>
 
 int check_shifts(uint8_t *inst, size_t len, bool replace);
+int check_andn(uint8_t *inst, size_t len, bool replace);
 
 #endif

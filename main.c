@@ -169,6 +169,14 @@ int main(int argc, char **argv)
             return 1;
         }
         rewrites += section_rewrites;
+        int andn_rewrites = check_andn(buf, section_header->sh_size, /*replace=*/ !dry_run);
+        if (andn_rewrites < 0) {
+            fprintf(stderr, "check_andn failed on section %u\n", idx);
+            munmap(addr, file_size);
+            close(fd);
+            return 1;
+        }
+        rewrites += andn_rewrites;
     }
 
     printf("%d rewrites\n", rewrites);

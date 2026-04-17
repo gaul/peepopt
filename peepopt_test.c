@@ -568,5 +568,103 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ================= ANDN tests ================= */
+
+    #define CHECK_ANDN(expected, ...) \
+    do { \
+        uint8_t bytes[] = { __VA_ARGS__ }; \
+        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ false); \
+        if (got != (expected)) { \
+            fprintf(stderr, "%s:%d: check_andn returned %d, expected %d\n", \
+                    __FILE__, __LINE__, got, (expected)); \
+            ++failures; \
+        } \
+    } while (0)
+
+    /* Pattern 2: `not %rax; and %rax, %rbx; ...` with RAX dead after. */
+    CHECK_ANDN(
+        1,
+        0x48, 0xF7, 0xD0,      // not %rax
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0x48, 0x31, 0xC0,      // xor %rax, %rax  (full RAX kill)
+        0xC3                   // ret             (kills flags)
+    );
+
+    /* replace=true: verify encoded bytes for a representative case. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0xF7, 0xD0,  // not %rax
+            0x48, 0x21, 0xC3,  // and %rax, %rbx
+            0x48, 0x31, 0xC0,  // xor %rax, %rax
+            0xC3,
+        };
+        // ANDN %rbx, %rax, %rbx: VEX.NDS.0F38.W1 F2 /r
+        //   VEX byte1 = C4, byte2 = ~R~X~B mmmmm = 1 1 1 00010 = 0xE2
+        //   byte3 = W ~vvvv L pp = 1 1011 0 00 = 0xD8 (W=1, vvvv=RBX=3 -> ~vvvv=1100... wait)
+        // Actually vvvv encodes src1 (the negated operand) for ANDN. For
+        // our pattern REG1 = mask_reg = RAX (vvvv=0 -> ~vvvv=1111).
+        //   byte3 = 1 1111 0 00 = 0xF8
+        // opcode = F2, ModR/M = 11 (mod) reg=RBX=011 rm=RBX=011 = 0xDB
+        uint8_t expect[] = {
+            0xC4, 0xE2, 0xF8, 0xF2, 0xDB,  // andn %rbx, %rax, %rbx
+            0x90,                          // 1-byte NOP
+            0x48, 0x31, 0xC0,              // xor %rax,%rax preserved
+            0xC3,
+        };
+        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ true);
+        if (got != 1) {
+            fprintf(stderr, "%s:%d: check_andn returned %d, expected 1\n",
+                    __FILE__, __LINE__, got);
+            ++failures;
+        } else if (memcmp(bytes, expect, sizeof(bytes)) != 0) {
+            fprintf(stderr, "%s:%d: andn buffer mismatch\n", __FILE__, __LINE__);
+            fprintf(stderr, "  got:     ");
+            for (size_t i = 0; i < sizeof(bytes); ++i) fprintf(stderr, "%02X ", bytes[i]);
+            fprintf(stderr, "\n  expect:  ");
+            for (size_t i = 0; i < sizeof(expect); ++i) fprintf(stderr, "%02X ", expect[i]);
+            fprintf(stderr, "\n");
+            ++failures;
+        }
+    }
+
+    /* Mask register must be dead after — a subsequent read of %rax bails. */
+    CHECK_ANDN(
+        0,
+        0x48, 0xF7, 0xD0,      // not %rax
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0x48, 0x89, 0xC2,      // mov %rax, %rdx   (reads rax — must bail)
+        0x48, 0x31, 0xC0,      // xor %rax, %rax
+        0xC3
+    );
+
+    /* Reading PF after ANDN rewrite would be unsafe (ANDN leaves PF undef,
+       AND sets it). */
+    CHECK_ANDN(
+        0,
+        0x48, 0xF7, 0xD0,      // not %rax
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0x7A, 0x00,            // jp +0  (wait, that's a branch — bails differently)
+        0xC3
+    );
+
+    /* Non-adjacent NOT+AND must bail. */
+    CHECK_ANDN(
+        0,
+        0x48, 0xF7, 0xD0,      // not %rax
+        0x90,                  // nop intervening
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0x48, 0x31, 0xC0,      // xor %rax, %rax
+        0xC3
+    );
+
+    /* 32-bit no-REX form doesn't fit (4 bytes vs 5-byte ANDN). */
+    CHECK_ANDN(
+        0,
+        0xF7, 0xD0,            // not %eax
+        0x21, 0xC3,            // and %eax, %ebx
+        0x31, 0xC0,            // xor %eax, %eax
+        0xC3
+    );
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

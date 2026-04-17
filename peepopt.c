@@ -230,6 +230,89 @@ static uint32_t read_rflags_mask(const xed_decoded_inst_t *xedd)
     return xed_flag_set_mask(xed_simple_flag_get_read_flag_set(sflag));
 }
 
+// Accessors for an arbitrary register's alias family. `inst_touches_reg` tells
+// us whether any operand touches the 64-bit alias of `query`; `kills_reg_full`
+// is the "full-width pure write" analog of kills_ecx for a caller-specified
+// register (no ABI assumption — CALL/RET are not treated as kills here).
+static void inst_touches_reg(const xed_decoded_inst_t *xedd, xed_reg_enum_t query,
+                             bool *writes, bool *reads)
+{
+    *writes = false;
+    *reads = false;
+    xed_reg_enum_t family = xed_get_largest_enclosing_register(query);
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned int n = xed_inst_noperands(xi);
+    for (unsigned int i = 0; i < n; i++) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd, xed_operand_name(op));
+        if (reg == XED_REG_INVALID) {
+            continue;
+        }
+        if (xed_get_largest_enclosing_register(reg) != family) {
+            continue;
+        }
+        xed_operand_action_enum_t a = xed_operand_rw(op);
+        if (action_writes(a)) *writes = true;
+        if (action_reads(a))  *reads = true;
+    }
+}
+
+// `xor %reg, %reg` (where both operands are the same full-width register) is
+// a semantic kill: the result is 0 regardless of reg's prior value, so any
+// read of reg inside the instruction is irrelevant.
+static bool is_zeroing_idiom_on(const xed_decoded_inst_t *xedd, xed_reg_enum_t query)
+{
+    if (xed_decoded_inst_get_iclass(xedd) != XED_ICLASS_XOR) {
+        return false;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    if (xed_inst_noperands(xi) < 2) {
+        return false;
+    }
+    xed_reg_enum_t r0 = xed_decoded_inst_get_reg(xedd,
+            xed_operand_name(xed_inst_operand(xi, 0)));
+    xed_reg_enum_t r1 = xed_decoded_inst_get_reg(xedd,
+            xed_operand_name(xed_inst_operand(xi, 1)));
+    if (r0 != r1 || xed_get_register_width_bits(r0) < 32) {
+        return false;
+    }
+    xed_reg_enum_t family = xed_get_largest_enclosing_register(query);
+    return xed_get_largest_enclosing_register(r0) == family;
+}
+
+static bool kills_reg_full(const xed_decoded_inst_t *xedd, xed_reg_enum_t query)
+{
+    if (is_zeroing_idiom_on(xedd, query)) {
+        return true;
+    }
+    xed_reg_enum_t family = xed_get_largest_enclosing_register(query);
+    if (family == XED_REG_INVALID) {
+        return false;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned int n = xed_inst_noperands(xi);
+    bool full_write = false;
+    bool any_read = false;
+    for (unsigned int i = 0; i < n; i++) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd, xed_operand_name(op));
+        if (reg == XED_REG_INVALID ||
+            xed_get_largest_enclosing_register(reg) != family) {
+            continue;
+        }
+        xed_operand_action_enum_t a = xed_operand_rw(op);
+        if (action_reads(a)) {
+            any_read = true;
+        }
+        if (action_writes(a) && xed_get_register_width_bits(reg) >= 32) {
+            // 32-bit writes zero-extend to the full 64-bit register, so the
+            // 32- or 64-bit write is a full kill. 8/16-bit writes are not.
+            full_write = true;
+        }
+    }
+    return full_write && !any_read;
+}
+
 static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                               const uint8_t *branch_targets);
 
@@ -756,5 +839,232 @@ end:
         offset += xed_decoded_inst_get_length(&xedd);
     }
 
+    return count;
+}
+
+static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
+                            const uint8_t *branch_targets);
+
+int check_andn(uint8_t *inst, size_t len, bool replace)
+{
+    size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
+    uint8_t *targets = calloc(bitmap_bytes, 1);
+    if (targets == NULL) {
+        return -1;
+    }
+    collect_branch_targets(inst, len, targets);
+    int result = check_andn_impl(inst, len, replace, targets);
+    free(targets);
+    return result;
+}
+
+// Rewrite `not %reg_A; and %reg_A, %reg_B` as `andn %reg_A, %reg_B, %reg_B`.
+// ANDN reads the un-negated value of reg_A directly, so after the rewrite
+// reg_A holds its original value rather than the inverted one; we refuse
+// unless reg_A is overwritten before any subsequent read. ANDN also leaves PF
+// undefined whereas AND sets it based on the result, so PF must be clobbered
+// before any read. CF/OF/SF/ZF are written identically by both.
+static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
+                            const uint8_t *branch_targets)
+{
+    int count = 0;
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    struct inst_history history;
+    history_reset(&history);
+
+    // PF is bit 2 of xed_flag_set_t.flat.
+    const uint32_t pf_bit = 1u << 2;
+
+    for (size_t offset = 0; offset < len;) {
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+
+        xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
+        if (err != XED_ERROR_NONE) {
+            printf("Decoding error at offset: %zu: %s\n", offset,
+                    xed_error_enum_t2str(err));
+            return -1;
+        }
+
+        if (xed_decoded_inst_get_iclass(&xedd) != XED_ICLASS_AND) {
+            goto end;
+        }
+        if (xed_decoded_inst_number_of_memory_operands(&xedd) != 0 ||
+            xed_decoded_inst_get_immediate_width_bits(&xedd) != 0) {
+            goto end;
+        }
+
+        // Extract AND's two register operands. The EFLAGS write is also an
+        // operand; skip it by register name. Anything else bails.
+        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+        unsigned int n = xed_inst_noperands(xi);
+        xed_reg_enum_t and_dst = XED_REG_INVALID;
+        xed_reg_enum_t and_src = XED_REG_INVALID;
+        bool form_ok = true;
+        for (unsigned int i = 0; form_ok && i < n; i++) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t op_name = xed_operand_name(op);
+            xed_operand_action_enum_t act = xed_operand_rw(op);
+            if (!xed_operand_is_register(op_name)) {
+                form_ok = false;
+                continue;
+            }
+            xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd, op_name);
+            if (reg == XED_REG_EFLAGS || reg == XED_REG_RFLAGS ||
+                reg == XED_REG_FLAGS) {
+                continue;
+            }
+            if (act == XED_OPERAND_ACTION_RW) {
+                and_dst = reg;
+            } else if (act == XED_OPERAND_ACTION_R) {
+                and_src = reg;
+            } else {
+                form_ok = false;
+            }
+        }
+        if (!form_ok || and_dst == XED_REG_INVALID || and_src == XED_REG_INVALID) {
+            goto end;
+        }
+
+        // Find an adjacent preceding NOT on one of AND's source operands.
+        const struct inst_history_entry *not_entry = history_at(&history, 1);
+        if (not_entry == NULL) {
+            goto end;
+        }
+        if (xed_decoded_inst_get_iclass(&not_entry->xedd) != XED_ICLASS_NOT) {
+            goto end;
+        }
+        if (xed_decoded_inst_number_of_memory_operands(&not_entry->xedd) != 0) {
+            goto end;
+        }
+        if (not_entry->offset + xed_decoded_inst_get_length(&not_entry->xedd) != offset) {
+            goto end;
+        }
+
+        const xed_inst_t *xi_not = xed_decoded_inst_inst(&not_entry->xedd);
+        xed_reg_enum_t not_reg = XED_REG_INVALID;
+        if (xed_inst_noperands(xi_not) >= 1) {
+            const xed_operand_t *op = xed_inst_operand(xi_not, 0);
+            if (xed_operand_is_register(xed_operand_name(op)) &&
+                xed_operand_rw(op) == XED_OPERAND_ACTION_RW) {
+                not_reg = xed_decoded_inst_get_reg(&not_entry->xedd,
+                                                    xed_operand_name(op));
+            }
+        }
+        if (not_reg == XED_REG_INVALID) {
+            goto end;
+        }
+
+        // We currently handle pattern 2 only: NOT's register is AND's R-only
+        // source. The other case (NOT's register == AND's dst) is rarer and
+        // less clean to encode (REG0 and REG1 would share a register).
+        if (xed_get_largest_enclosing_register(not_reg) !=
+            xed_get_largest_enclosing_register(and_src)) {
+            goto end;
+        }
+        xed_reg_enum_t mask_reg = and_src;
+        xed_reg_enum_t other_reg = and_dst;
+
+        unsigned int eow = xed_get_register_width_bits(and_dst);
+        if (eow != 32 && eow != 64) {
+            goto end;
+        }
+
+        // Forward lookahead: mask_reg must be fully overwritten before any
+        // read, and PF must be overwritten before any PF read.
+        bool mask_killed = false;
+        uint32_t killed_flags = 0;
+        size_t new_offset = offset + xed_decoded_inst_get_length(&xedd);
+        for (int i = 0; i < 16 && new_offset < len; i++) {
+            xed_decoded_inst_t xedd_new;
+            xed_decoded_inst_zero(&xedd_new);
+            xed_decoded_inst_set_mode(&xedd_new, mmode, stack_addr_width);
+            err = xed_decode(&xedd_new, inst + new_offset, len - new_offset);
+            if (err != XED_ERROR_NONE) {
+                return -1;
+            }
+            if (is_branch_bailout(&xedd_new)) {
+                goto end;
+            }
+            bool w = false, r = false;
+            inst_touches_reg(&xedd_new, mask_reg, &w, &r);
+            bool zeroing = is_zeroing_idiom_on(&xedd_new, mask_reg);
+            if (r && !zeroing && !mask_killed) {
+                goto end;
+            }
+            uint32_t read_mask = read_rflags_mask(&xedd_new);
+            if ((read_mask & pf_bit & ~killed_flags) != 0) {
+                goto end;
+            }
+            if (kills_reg_full(&xedd_new, mask_reg)) {
+                mask_killed = true;
+            }
+            killed_flags |= written_rflags_mask(&xedd_new);
+            if (mask_killed && (pf_bit & ~killed_flags) == 0) {
+                break;
+            }
+            new_offset += xed_decoded_inst_get_length(&xedd_new);
+        }
+        if (!mask_killed || (pf_bit & ~killed_flags) != 0) {
+            goto end;
+        }
+
+        // Encode ANDN via the high-level builder.
+        xed_state_t state;
+        xed_state_zero(&state);
+        state.mmode = XED_MACHINE_MODE_LONG_64;
+        state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+        xed_encoder_instruction_t enc_inst;
+        xed_inst3(&enc_inst, state, XED_ICLASS_ANDN, eow,
+                  xed_reg(and_dst), xed_reg(mask_reg), xed_reg(other_reg));
+        xed_encoder_request_t req;
+        xed_encoder_request_zero_set_mode(&req, &state);
+        if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+            goto end;
+        }
+        uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
+        unsigned int new_len = 0;
+        xed_error_enum_t enc_err = xed_encode(&req, new_bytes, sizeof(new_bytes),
+                                               &new_len);
+        if (enc_err != XED_ERROR_NONE) {
+            goto end;
+        }
+
+        unsigned int old_len = (offset + xed_decoded_inst_get_length(&xedd)) -
+                               not_entry->offset;
+        if (new_len > old_len) {
+            goto end;
+        }
+        size_t rewrite_end = offset + xed_decoded_inst_get_length(&xedd);
+        if (target_in_interior(branch_targets, not_entry->offset, rewrite_end)) {
+            goto end;
+        }
+
+        printf("R andn %s, %s, %s [%u bytes, replacing %u]\n",
+                xed_reg_enum_t2str(and_dst), xed_reg_enum_t2str(mask_reg),
+                xed_reg_enum_t2str(other_reg), new_len, old_len);
+        ++count;
+
+        if (replace) {
+            uint8_t *addr = inst + not_entry->offset;
+            memcpy(addr, new_bytes, new_len);
+            if (old_len > new_len) {
+                enc_err = xed_encode_nop(addr + new_len, old_len - new_len);
+                if (enc_err != XED_ERROR_NONE) {
+                    return -1;
+                }
+            }
+        }
+
+end:
+        if (is_basic_block_terminator(&xedd)) {
+            history_reset(&history);
+        } else {
+            history_push(&history, &xedd, offset);
+        }
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
     return count;
 }
