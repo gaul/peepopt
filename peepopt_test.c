@@ -376,6 +376,17 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ 32-bit shift with 64-bit MOV1 source: demote to 32-bit count ------ */
+    // `mov %r8,%rcx; shl %cl,%eax; ret` has mov_src=R8 (64-bit) but shift_dst
+    // is EAX (32-bit). Previously this hit GENERAL_ERROR in the encoder; now
+    // the count register is demoted to R8D for the rewrite.
+    CHECK_BYTES(
+        1,
+        0x4C, 0x89, 0xC1,  // movq %r8,%rcx
+        0xD3, 0xE0,        // sall %cl,%eax
+        0xC3               // ret
+    );
+
     /* ------ Soundness: partial-CL write is NOT a full ECX kill ------ */
     // Previously `mov $1, %cl` counted as kills_ecx, but it leaves the upper
     // 24 bits of ECX holding MOV1's value. A subsequent read of %ecx would see

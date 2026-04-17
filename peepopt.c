@@ -373,11 +373,18 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                 goto end;
             }
 
-            if (xed_get_register_width_bits(shift_dst) == 64 &&
-                    xed_get_register_width_bits(mov_src) == 32) {
-                // Promote 32-bit register sources to 64-bit
-                // TODO: is this always safe?
+            // SHLX requires the count register's width to match the effective
+            // operand width. x86 shifts mask the count to 5 bits (32-bit) or
+            // 6 bits (64-bit), and those low bits alias across the register's
+            // widths, so either direction is safe. The GPR enum is laid out
+            // so that RXX - EXX is a constant across both the legacy (AX/CX/...)
+            // and extended (R8..R15) ranges.
+            unsigned int shift_width = xed_get_register_width_bits(shift_dst);
+            unsigned int mov_src_width = xed_get_register_width_bits(mov_src);
+            if (shift_width == 64 && mov_src_width == 32) {
                 mov_src = mov_src - XED_REG_EAX + XED_REG_RAX;
+            } else if (shift_width == 32 && mov_src_width == 64) {
+                mov_src = mov_src - XED_REG_RAX + XED_REG_EAX;
             }
 
             // Optionally absorb a second MOV that supplies shift_dst's value. The gcc
