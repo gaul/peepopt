@@ -389,47 +389,70 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
             // at the original shift.
             xed_reg_enum_t shlx_rm = shift_dst;
             size_t rewrite_offset = mov_entry->offset;
-            if (!reg_aliases_rcx(shift_dst)) {
+            const xed_decoded_inst_t *mov2_mem_source = NULL;
+            if (!reg_aliases_rcx(shift_dst) &&
+                xed_get_largest_enclosing_register(mov_src) != xed_get_largest_enclosing_register(shift_dst)) {
                 const struct inst_history_entry *mov2_entry = history_at(&history, 2);
                 if (mov2_entry != NULL &&
                     xed_decoded_inst_get_iclass(&mov2_entry->xedd) == XED_ICLASS_MOV &&
-                    xed_decoded_inst_number_of_memory_operands(&mov2_entry->xedd) == 0 &&
                     xed_decoded_inst_get_immediate_width_bits(&mov2_entry->xedd) == 0) {
+                    unsigned int nmem = xed_decoded_inst_number_of_memory_operands(&mov2_entry->xedd);
                     const xed_inst_t *xi2 = xed_decoded_inst_inst(&mov2_entry->xedd);
                     unsigned int n2 = xed_inst_noperands(xi2);
                     xed_reg_enum_t mov2_dst = XED_REG_INVALID;
-                    xed_reg_enum_t mov2_src = XED_REG_INVALID;
-                    bool mov2_reg_to_reg = true;
-                    for (unsigned int i = 0; i < n2; i++) {
+                    xed_reg_enum_t mov2_src_reg = XED_REG_INVALID;
+                    bool form_ok = (nmem == 0 || nmem == 1);
+                    for (unsigned int i = 0; form_ok && i < n2; i++) {
                         const xed_operand_t *op = xed_inst_operand(xi2, i);
                         xed_operand_enum_t op_name = xed_operand_name(op);
-                        if (!xed_operand_is_register(op_name)) {
-                            mov2_reg_to_reg = false;
-                            break;
-                        }
                         xed_operand_action_enum_t act = xed_operand_rw(op);
-                        xed_reg_enum_t reg = xed_decoded_inst_get_reg(&mov2_entry->xedd, op_name);
-                        if (act == XED_OPERAND_ACTION_W) {
-                            mov2_dst = reg;
-                        } else if (act == XED_OPERAND_ACTION_R) {
-                            mov2_src = reg;
-                        } else {
-                            mov2_reg_to_reg = false;
-                            break;
+                        if (xed_operand_is_register(op_name)) {
+                            xed_reg_enum_t reg = xed_decoded_inst_get_reg(&mov2_entry->xedd, op_name);
+                            if (act == XED_OPERAND_ACTION_W) {
+                                mov2_dst = reg;
+                            } else if (act == XED_OPERAND_ACTION_R) {
+                                mov2_src_reg = reg;
+                            } else {
+                                form_ok = false;
+                            }
+                        } else if (op_name == XED_OPERAND_MEM0) {
+                            if (act != XED_OPERAND_ACTION_R) {
+                                form_ok = false;
+                            }
+                        } else if (op_name != XED_OPERAND_BASE0 &&
+                                   op_name != XED_OPERAND_INDEX &&
+                                   op_name != XED_OPERAND_SCALE &&
+                                   op_name != XED_OPERAND_SEG0) {
+                            form_ok = false;
                         }
                     }
-                    // Require MOV2 to be adjacent to MOV1 so no other instruction sits
-                    // between MOV2 and the shift that could alter shift_dst or mov2_src.
+                    // Require MOV2 to be adjacent to MOV1 so only MOV1 sits
+                    // between MOV2 and the shift; MOV1 is reg-to-reg and thus
+                    // cannot alter memory or mov2_src_reg.
                     size_t mov2_end = mov2_entry->offset + xed_decoded_inst_get_length(&mov2_entry->xedd);
-                    if (mov2_reg_to_reg &&
+                    bool addr_ok = true;
+                    if (nmem == 1) {
+                        // SHLX has a different encoded length than MOV2, so a
+                        // RIP-relative displacement wouldn't target the same byte.
+                        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&mov2_entry->xedd, 0);
+                        if (base == XED_REG_RIP || base == XED_REG_EIP) {
+                            addr_ok = false;
+                        }
+                    }
+                    if (form_ok &&
+                        addr_ok &&
                         mov2_dst == shift_dst &&
-                        mov2_src != XED_REG_INVALID &&
-                        !reg_aliases_rcx(mov2_src) &&
-                        xed_get_largest_enclosing_register(mov_src) != xed_get_largest_enclosing_register(shift_dst) &&
-                        mov2_end == mov_entry->offset) {
-                        printf("Absorbing MOV that sets shift_dst (%s := %s)\n",
-                                xed_reg_enum_t2str(mov2_dst), xed_reg_enum_t2str(mov2_src));
-                        shlx_rm = mov2_src;
+                        mov2_end == mov_entry->offset &&
+                        (nmem == 1 ||
+                         (mov2_src_reg != XED_REG_INVALID && !reg_aliases_rcx(mov2_src_reg)))) {
+                        if (nmem == 1) {
+                            printf("Absorbing MOV2 with memory source into SHLX\n");
+                            mov2_mem_source = &mov2_entry->xedd;
+                        } else {
+                            printf("Absorbing MOV that sets shift_dst (%s := %s)\n",
+                                    xed_reg_enum_t2str(mov2_dst), xed_reg_enum_t2str(mov2_src_reg));
+                            shlx_rm = mov2_src_reg;
+                        }
                         rewrite_offset = mov2_entry->offset;
                     }
                 }
@@ -500,20 +523,39 @@ int check_shifts(uint8_t *inst, size_t len, bool replace)
                 state.mmode = XED_MACHINE_MODE_LONG_64;
                 state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
 
-                xed_encoder_request_t req;
-                xed_encoder_request_zero_set_mode(&req, &state);
-                xed_encoder_request_set_iclass(&req,
+                xed_iclass_enum_t new_iclass =
                         iclass == XED_ICLASS_SHL ? XED_ICLASS_SHLX :
                         iclass == XED_ICLASS_SHR ? XED_ICLASS_SHRX :
                         iclass == XED_ICLASS_SAR ? XED_ICLASS_SARX :
-                                                   XED_ICLASS_INVALID);
-                xed_encoder_request_set_effective_operand_width(&req, xed_get_register_width_bits(shift_dst));
-                xed_encoder_request_set_reg(&req, XED_OPERAND_REG0, shift_dst);
-                xed_encoder_request_set_operand_order(&req, 0, XED_OPERAND_REG0);
-                xed_encoder_request_set_reg(&req, XED_OPERAND_REG1, shlx_rm);
-                xed_encoder_request_set_operand_order(&req, 1, XED_OPERAND_REG1);
-                xed_encoder_request_set_reg(&req, XED_OPERAND_REG2, mov_src);
-                xed_encoder_request_set_operand_order(&req, 2, XED_OPERAND_REG2);
+                                                   XED_ICLASS_INVALID;
+                xed_uint_t eow = xed_get_register_width_bits(shift_dst);
+
+                xed_encoder_operand_t op_rm;
+                if (mov2_mem_source != NULL) {
+                    xed_uint_t mem_width_bits =
+                            xed_decoded_inst_get_memory_operand_length(mov2_mem_source, 0) * 8;
+                    op_rm = xed_mem_gbisd(
+                            xed_decoded_inst_get_seg_reg(mov2_mem_source, 0),
+                            xed_decoded_inst_get_base_reg(mov2_mem_source, 0),
+                            xed_decoded_inst_get_index_reg(mov2_mem_source, 0),
+                            xed_decoded_inst_get_scale(mov2_mem_source, 0),
+                            xed_disp(xed_decoded_inst_get_memory_displacement(mov2_mem_source, 0),
+                                     xed_decoded_inst_get_memory_displacement_width_bits(mov2_mem_source, 0)),
+                            mem_width_bits);
+                } else {
+                    op_rm = xed_reg(shlx_rm);
+                }
+
+                xed_encoder_instruction_t enc_inst;
+                xed_inst3(&enc_inst, state, new_iclass, eow,
+                          xed_reg(shift_dst), op_rm, xed_reg(mov_src));
+
+                xed_encoder_request_t req;
+                xed_encoder_request_zero_set_mode(&req, &state);
+                if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+                    printf("Could not convert SHLX request\n");
+                    goto end;
+                }
                 xed_error_enum_t err = xed_encode(&req, new_bytes, sizeof(new_bytes), &new_len);
                 if (err != XED_ERROR_NONE) {
                     printf("Could not encode instruction: %s\n", xed_error_enum_t2str(err));

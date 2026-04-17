@@ -312,6 +312,57 @@ int main(int argc, char *argv[])
         check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
     }
 
+    /* ------ MOV2 absorption with memory source: `mov (%rsi),%eax; ...` ------ */
+    {
+        uint8_t bytes[] = {
+            0x8B, 0x06,              // movl (%rsi),%eax         (MOV2 mem source)
+            0x44, 0x89, 0xC1,        // movl %r8d,%ecx            (MOV1)
+            0xD3, 0xE0,              // sall %cl,%eax
+            0xC3,                    // ret
+        };
+        uint8_t expect[] = {
+            0xC4, 0xE2, 0x39, 0xF7, 0x06,  // shlxl %r8d,(%rsi),%eax
+            0x66, 0x90,                    // 2-byte NOP
+            0xC3,                          // ret
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
+    /* ------ MOV2 absorption with SIB-addressed memory source ------ */
+    {
+        uint8_t bytes[] = {
+            0x8B, 0x04, 0xBE,        // movl (%rsi,%rdi,4),%eax   (MOV2 SIB)
+            0x44, 0x89, 0xC1,        // movl %r8d,%ecx
+            0xD3, 0xE0,              // sall %cl,%eax
+            0xC3,                    // ret
+        };
+        uint8_t expect[] = {
+            0xC4, 0xE2, 0x39, 0xF7, 0x04, 0xBE,  // shlxl %r8d,(%rsi,%rdi,4),%eax
+            0x66, 0x90,                          // 2-byte NOP
+            0xC3,
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
+    /* ------ RIP-relative MOV2 must NOT be absorbed (displacement would drift) ------ */
+    // MOV2 is `mov 0x100(%rip),%eax` (7 bytes). Absorption would place SHLX at
+    // MOV2's offset; SHLX's different length makes the RIP-relative target
+    // land on a different byte. Fall back to MOV1+shift rewrite only.
+    {
+        uint8_t bytes[] = {
+            0x8B, 0x05, 0x00, 0x01, 0x00, 0x00,  // mov 0x100(%rip),%eax
+            0x44, 0x89, 0xC1,                    // movl %r8d,%ecx
+            0xD3, 0xE0,                          // sall %cl,%eax
+            0xC3,                                // ret
+        };
+        uint8_t expect[] = {
+            0x8B, 0x05, 0x00, 0x01, 0x00, 0x00,  // MOV2 preserved
+            0xC4, 0xE2, 0x39, 0xF7, 0xC0,        // shlxl %r8d,%eax,%eax (MOV1+SHL only)
+            0xC3,
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
     /* ------ MOV2 absorption must not fire when shift_dst aliases RCX ------ */
     // `mov src1, %eax; mov src2, %ecx; shl %cl, %ecx` — here shift_dst is ECX so
     // MOV1 overwrites shift_dst before the shift; absorbing MOV2 would shift a
