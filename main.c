@@ -43,7 +43,7 @@ int main(int argc, char **argv)
     uint32_t idx;
     int rewrites = 0;
     bool dry_run = false;
-    bool verbose = false;  // TODO:
+    bool verbose = false;
     static const struct option long_opts[] = {
         { "dry-run", no_argument,       0, 'd' },
         { "verbose", no_argument,       0, 'v' },
@@ -67,6 +67,8 @@ int main(int argc, char **argv)
     if (optind >= argc) {
         usage(argv[0]);
     }
+
+    peepopt_set_verbose(verbose);
 
     int fd = open(argv[optind], dry_run ? O_RDONLY : O_RDWR);
     if (fd == -1) {
@@ -150,7 +152,9 @@ int main(int argc, char **argv)
             fprintf(stderr, "section %u name is not NUL-terminated\n", idx);
             continue;
         }
-        printf("name: %s\n", name);
+        if (verbose) {
+            printf("name: %s\n", name);
+        }
         if (strcmp(name, ".text") != 0) {
             continue;
         }

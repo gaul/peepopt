@@ -23,6 +23,15 @@
 #include "peepopt.h"
 #include "xed/xed-interface.h"
 
+static bool g_verbose = false;
+
+void peepopt_set_verbose(bool verbose)
+{
+    g_verbose = verbose;
+}
+
+#define VLOG(...) do { if (g_verbose) printf(__VA_ARGS__); } while (0)
+
 #define HISTORY_SIZE 8
 
 struct inst_history_entry {
@@ -395,7 +404,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
 
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
-            printf("Decoding error at offset: %zu: %s\n", offset, xed_error_enum_t2str(err));
+            fprintf(stderr, "Decoding error at offset: %zu: %s\n", offset, xed_error_enum_t2str(err));
             return -1;
         }
 
@@ -405,7 +414,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 offset,  // IP address (for relative branch calculation) TODO: this seems incorrect
                 /*context=*/ NULL, /*symbolic_callback=*/ NULL);
         if (ok) {
-            printf("* %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd));
+            VLOG("* %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd));
         }
 
         // TODO: check XED_IFORM_SHL_GPR32_CL instead of number of memory operands?
@@ -464,7 +473,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             size_t mov1_len_for_gap = xed_decoded_inst_get_length(xedd_old);
             bool mov1_adjacent = (mov_entry->offset + mov1_len_for_gap == offset);
 
-            printf("Examining MOV + shift pair\n");
+            VLOG("Examining MOV + shift pair\n");
 
             xed_reg_enum_t shift_src = XED_REG_INVALID;
             xed_reg_enum_t shift_dst = XED_REG_INVALID;
@@ -483,7 +492,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
 
                 xed_operand_action_enum_t action = xed_operand_rw(op);
                 xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd_old, xed_operand_name(op));
-                printf("mov   operand %u %s action register %s\n", i, xed_operand_action_enum_t2str(action), xed_reg_enum_t2str(reg));
+                VLOG("mov   operand %u %s action register %s\n", i, xed_operand_action_enum_t2str(action), xed_reg_enum_t2str(reg));
 
                 if (action == XED_OPERAND_ACTION_R) {
                     mov_src = reg;
@@ -505,13 +514,13 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
 
                 xed_operand_action_enum_t action = xed_operand_rw(op);
                 xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd, xed_operand_name(op));
-                printf("shift operand %u %s action register %s\n", i, xed_operand_action_enum_t2str(action), xed_reg_enum_t2str(reg));
+                VLOG("shift operand %u %s action register %s\n", i, xed_operand_action_enum_t2str(action), xed_reg_enum_t2str(reg));
 
                 if (action == XED_OPERAND_ACTION_R) {
                     shift_src = reg;
                 } else if (action == XED_OPERAND_ACTION_RW || action == XED_OPERAND_ACTION_W) {
                     if (xed_get_register_width_bits(reg) < 32) {
-                        printf("Ignore partial registers\n");
+                        VLOG("Ignore partial registers\n");
                         goto end;
                     }
                     shift_dst = reg;
@@ -522,12 +531,12 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 }
             }
 
-            printf("MOV src: %s MOV dst: %s SHR src: %s SHR dst: %s\n",
+            VLOG("MOV src: %s MOV dst: %s SHR src: %s SHR dst: %s\n",
                     xed_reg_enum_t2str(mov_src), xed_reg_enum_t2str(mov_dst),
                     xed_reg_enum_t2str(shift_src), xed_reg_enum_t2str(shift_dst));
             // TODO: check that the source and dest operands and widths match
             if (!((mov_dst == XED_REG_ECX || mov_dst == XED_REG_RCX) && shift_src == XED_REG_CL)) {
-                printf("Wrong register pairs for replacement\n");
+                VLOG("Wrong register pairs for replacement\n");
                 goto end;
             }
 
@@ -541,7 +550,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             // of the parent aren't the low 5 bits of AH/BH/CH/DH. Refuse them.
             if (mov_src == XED_REG_AH || mov_src == XED_REG_BH ||
                 mov_src == XED_REG_CH || mov_src == XED_REG_DH) {
-                printf("MOV1 source is a high-byte register; cannot use in SHLX\n");
+                VLOG("MOV1 source is a high-byte register; cannot use in SHLX\n");
                 goto end;
             }
             unsigned int shift_width = xed_get_register_width_bits(shift_dst);
@@ -635,12 +644,12 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                         (nmem == 1 ||
                          (mov2_src_reg != XED_REG_INVALID && !reg_aliases_rcx(mov2_src_reg)))) {
                         if (nmem == 1) {
-                            printf("Absorbing MOV2 with memory source into SHLX\n");
+                            VLOG("Absorbing MOV2 with memory source into SHLX\n");
                             mov2_mem_source = &mov2_entry->xedd;
                             mov2_source_offset = mov2_entry->offset;
                             mov2_source_len = xed_decoded_inst_get_length(&mov2_entry->xedd);
                         } else {
-                            printf("Absorbing MOV that sets shift_dst (%s := %s)\n",
+                            VLOG("Absorbing MOV that sets shift_dst (%s := %s)\n",
                                     xed_reg_enum_t2str(mov2_dst), xed_reg_enum_t2str(mov2_src_reg));
                             shlx_rm = mov2_src_reg;
                         }
@@ -655,13 +664,13 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             // Non-adjacent MOV1 is only safe when the intervening gap was
             // entirely filled by an absorbable MOV2.
             if (!mov1_adjacent && shlx_rm == shift_dst && mov2_mem_source == NULL) {
-                printf("MOV1 at offset %zu is %zu bytes before shift and gap is not an absorbable MOV2; skipping\n",
+                VLOG("MOV1 at offset %zu is %zu bytes before shift and gap is not an absorbable MOV2; skipping\n",
                         mov_entry->offset,
                         offset - mov_entry->offset - mov1_len_for_gap);
                 goto end;
             }
 
-            printf("Higher confidence\n");
+            VLOG("Higher confidence\n");
 
             // Look ahead to verify ECX is dead and every rflag SHL writes is
             // overwritten before any instruction reads it. SHLX leaves rflags
@@ -678,7 +687,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 xed_decoded_inst_set_mode(&xedd_new, mmode, stack_addr_width);
                 err = xed_decode(&xedd_new, inst + new_offset, len - new_offset);
                 if (err != XED_ERROR_NONE) {
-                    printf("Decoding error at offset: %zu: %s\n", new_offset, xed_error_enum_t2str(err));
+                    fprintf(stderr, "Decoding error at offset: %zu: %s\n", new_offset, xed_error_enum_t2str(err));
                     return -1;
                 }
 
@@ -687,20 +696,20 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                         offset,  // IP address (for relative branch calculation) TODO: this seems incorrect
                         /*context=*/ NULL, /*symbolic_callback=*/ NULL);
                 if (ok) {
-                    printf("* %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd_new));
+                    VLOG("* %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd_new));
                 }
 
                 if (is_branch_bailout(&xedd_new)) {
-                    printf("Branch, cannot replace\n");
+                    VLOG("Branch, cannot replace\n");
                     goto end;
                 }
                 if (!ecx_written && reads_ecx(&xedd_new)) {
-                    printf("Reading from ECX, cannot replace\n");
+                    VLOG("Reading from ECX, cannot replace\n");
                     goto end;
                 }
                 uint32_t read_mask = read_rflags_mask(&xedd_new);
                 if ((read_mask & shift_flags_mask & ~killed_flags_mask) != 0) {
-                    printf("Reading a shift-written EFLAGS bit, cannot replace\n");
+                    VLOG("Reading a shift-written EFLAGS bit, cannot replace\n");
                     goto end;
                 }
                 if (kills_ecx(&xedd_new)) {
@@ -718,7 +727,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             bool eflags_written = (shift_flags_mask & ~killed_flags_mask) == 0;
             if (ecx_written && eflags_written) {
                 // assemble replacement instruction
-                printf("Highest confidence that replacement is possible\n");
+                VLOG("Highest confidence that replacement is possible\n");
                 uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
                 unsigned new_len = 0;
                 xed_state_t state;
@@ -770,20 +779,31 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 xed_encoder_request_t req;
                 xed_encoder_request_zero_set_mode(&req, &state);
                 if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
-                    printf("Could not convert SHLX request\n");
+                    fprintf(stderr, "Could not convert SHLX request\n");
                     goto end;
                 }
                 xed_error_enum_t err = xed_encode(&req, new_bytes, sizeof(new_bytes), &new_len);
                 if (err != XED_ERROR_NONE) {
-                    printf("Could not encode instruction: %s\n", xed_error_enum_t2str(err));
+                    fprintf(stderr, "Could not encode instruction: %s\n", xed_error_enum_t2str(err));
                     char buf[1024];
                     xed_encode_request_print(&req, buf, sizeof(buf));
-                    printf("%s\n", buf);
+                    fprintf(stderr, "%s\n", buf);
                     goto end;
                 }
 
                 unsigned int old_len = (offset + xed_decoded_inst_get_length(&xedd)) - rewrite_offset;
-                printf("Replacement instruction is %u bytes and original instructions are %u bytes\n", new_len, old_len);
+                VLOG("Replacement instruction is %u bytes and original instructions are %u bytes\n", new_len, old_len);
+                if (new_len > old_len) {
+                    VLOG("Cannot replace instructions since replacement is too large\n");
+                    goto end;
+                }
+                if (target_in_interior(branch_targets, rewrite_offset,
+                                       offset + xed_decoded_inst_get_length(&xedd))) {
+                    VLOG("Branch target inside rewrite range [%zu, %zu); skipping\n",
+                            rewrite_offset, offset + xed_decoded_inst_get_length(&xedd));
+                    goto end;
+                }
+
                 xed_decoded_inst_t xedd_tmp;
                 xed_decoded_inst_zero(&xedd_tmp);
                 xed_decoded_inst_set_mode(&xedd_tmp, mmode, stack_addr_width);
@@ -799,16 +819,6 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 if (ok) {
                     printf("R %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd_tmp));
                 }
-                if (new_len > old_len) {
-                    printf("Cannot replace instructions since replacement is too large\n");
-                    goto end;
-                }
-                if (target_in_interior(branch_targets, rewrite_offset,
-                                       offset + xed_decoded_inst_get_length(&xedd))) {
-                    printf("Branch target inside rewrite range [%zu, %zu); skipping\n",
-                            rewrite_offset, offset + xed_decoded_inst_get_length(&xedd));
-                    goto end;
-                }
                 ++count;
 
                 // TODO: consider that shift distance may be > 31 for ECX or > 63 for RCX
@@ -820,13 +830,13 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                     if (old_len - new_len > 0) {
                         err = xed_encode_nop(addr + new_len, old_len - new_len);
                         if (err != XED_ERROR_NONE) {
-                            printf("Could not encode no-ops: %s\n", xed_error_enum_t2str(err));
+                            fprintf(stderr, "Could not encode no-ops: %s\n", xed_error_enum_t2str(err));
                             return -1;
                         }
                     }
                 }
             } else {
-                printf("Replacement not possible ecx_written: %d eflags_written: %d\n", ecx_written, eflags_written);
+                VLOG("Replacement not possible ecx_written: %d eflags_written: %d\n", ecx_written, eflags_written);
             }
         }
 
@@ -883,7 +893,7 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
 
         xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
         if (err != XED_ERROR_NONE) {
-            printf("Decoding error at offset: %zu: %s\n", offset,
+            fprintf(stderr, "Decoding error at offset: %zu: %s\n", offset,
                     xed_error_enum_t2str(err));
             return -1;
         }

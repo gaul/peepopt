@@ -20,6 +20,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
+void peepopt_set_verbose(bool verbose);
 int check_shifts(uint8_t *inst, size_t len, bool replace);
 int check_andn(uint8_t *inst, size_t len, bool replace);
 
