@@ -572,6 +572,15 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             // bits, and those low bits alias across every width of a given
             // GPR, so we can substitute the 32- or 64-bit parent register.
             //
+            // The count source must be a general-purpose register. A non-GPR
+            // MOV1 source (e.g. `mov %fs,%ecx`, a segment register) would make
+            // the width promote/demote below compute a garbage register via
+            // enum arithmetic that assumes a parent in RAX..R15. Refuse it
+            // instead of relying on the encoder to reject the result.
+            if (xed_reg_class(mov_src) != XED_REG_CLASS_GPR) {
+                VLOG("MOV1 source is not a general-purpose register; cannot use in SHLX\n");
+                goto end;
+            }
             // High-byte registers (AH/BH/CH/DH) are the exception: their bits
             // live in bits [15:8] of the parent, not [7:0], so the low 5 bits
             // of the parent aren't the low 5 bits of AH/BH/CH/DH. Refuse them.

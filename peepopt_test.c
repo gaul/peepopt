@@ -593,6 +593,19 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ Soundness: non-GPR MOV1 source (segment register) must bail ------ */
+    // `mov %fs,%ecx` sets ECX from a segment register; mov_src is not a GPR, so
+    // the count-width enum arithmetic would compute a garbage register. Refuse
+    // rather than depend on the encoder rejecting it.
+    CHECK_BYTES(
+        0,
+        0x89, 0xF8,              // movl %edi,%eax
+        0x8C, 0xE1,              // mov %fs,%ecx       (segment source, not a GPR)
+        0xD3, 0xE0,              // sall %cl,%eax
+        0x31, 0xC9,              // xor %ecx,%ecx
+        0xC3
+    );
+
     /* ------ Soundness: absorbed memory-source MOV2 addressed through RCX ------ */
     // `mov %r8d,%ecx (MOV1); mov (%rcx),%eax (MOV2); shl %cl,%eax`. Absorbing
     // MOV2 into SHLX deletes MOV1, so the SHLX (%rcx) memory operand would use a
