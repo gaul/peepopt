@@ -106,6 +106,19 @@ static void inst_touches_rcx(const xed_decoded_inst_t *xedd, bool *writes, bool 
         if (action_writes(a)) *writes = true;
         if (action_reads(a))  *reads = true;
     }
+    // Base/index registers of a memory operand are read to compute the
+    // effective address, but XED does not surface that read through
+    // xed_operand_rw on the operand list above. Without folding them in, an
+    // addressing use of RCX (e.g. `mov (%rcx),%edx` or `mov (,%rcx,4),%edx`)
+    // looks dead, and the rewrite would delete the MOV that defined RCX,
+    // leaving the load/store pointing at a stale value.
+    unsigned int nmem = xed_decoded_inst_number_of_memory_operands(xedd);
+    for (unsigned int m = 0; m < nmem; m++) {
+        if (reg_aliases_rcx(xed_decoded_inst_get_base_reg(xedd, m)) ||
+            reg_aliases_rcx(xed_decoded_inst_get_index_reg(xedd, m))) {
+            *reads = true;
+        }
+    }
 }
 
 // Scan history backward (most-recent first) for the nearest instruction that writes RCX/ECX.
@@ -263,6 +276,20 @@ static void inst_touches_reg(const xed_decoded_inst_t *xedd, xed_reg_enum_t quer
         xed_operand_action_enum_t a = xed_operand_rw(op);
         if (action_writes(a)) *writes = true;
         if (action_reads(a))  *reads = true;
+    }
+    // Base/index registers participate in the address calculation as reads but
+    // are invisible to xed_operand_rw; fold them in explicitly so an addressing
+    // use of `query` is not mistaken for the register being dead.
+    unsigned int nmem = xed_decoded_inst_number_of_memory_operands(xedd);
+    for (unsigned int m = 0; m < nmem; m++) {
+        xed_reg_enum_t base = xed_decoded_inst_get_base_reg(xedd, m);
+        xed_reg_enum_t index = xed_decoded_inst_get_index_reg(xedd, m);
+        if ((base != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(base) == family) ||
+            (index != XED_REG_INVALID &&
+             xed_get_largest_enclosing_register(index) == family)) {
+            *reads = true;
+        }
     }
 }
 
@@ -639,7 +666,18 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                             form_ok = false;
                         }
                     }
+                    // A memory-source MOV2 is folded into SHLX at rewrite_offset,
+                    // which deletes MOV1 (the writer of RCX). If MOV2 addresses
+                    // through RCX, the absorbed load would dereference the stale,
+                    // pre-MOV1 value of RCX. Refuse it. (Conservative: this also
+                    // rejects the rarer layout where MOV2 precedes MOV1 and the
+                    // RCX value would actually be unaffected.)
+                    bool mov2_mem_addr_ok =
+                        nmem != 1 ||
+                        (!reg_aliases_rcx(xed_decoded_inst_get_base_reg(&mov2_entry->xedd, 0)) &&
+                         !reg_aliases_rcx(xed_decoded_inst_get_index_reg(&mov2_entry->xedd, 0)));
                     if (form_ok &&
+                        mov2_mem_addr_ok &&
                         mov2_dst == shift_dst &&
                         (nmem == 1 ||
                          (mov2_src_reg != XED_REG_INVALID && !reg_aliases_rcx(mov2_src_reg)))) {

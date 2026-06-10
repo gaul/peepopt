@@ -568,6 +568,43 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ Soundness: RCX read as a memory BASE before the kill must bail ------ */
+    // `mov %r8d,%ecx; shl %cl,%eax; mov (%rcx),%edx; xor %ecx,%ecx`. The load
+    // dereferences RCX, which the rewrite's deleted MOV1 had defined. A base or
+    // index use of RCX is a read and must prevent the rewrite.
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,        // movl %r8d,%ecx
+        0xD3, 0xE0,              // sall %cl,%eax
+        0x8B, 0x11,              // movl (%rcx),%edx   (reads RCX as base)
+        0x31, 0xC9,              // xor %ecx,%ecx
+        0xC3
+    );
+
+    /* ------ Soundness: RCX read as a memory INDEX before the kill must bail ------ */
+    // Realistic: a count used both as a shift amount and an array index.
+    // `mov %r8d,%ecx; shl %cl,%eax; mov (%rax,%rcx,4),%edx; xor %ecx,%ecx`.
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,        // movl %r8d,%ecx
+        0xD3, 0xE0,              // sall %cl,%eax
+        0x8B, 0x14, 0x88,        // movl (%rax,%rcx,4),%edx  (reads RCX as index)
+        0x31, 0xC9,              // xor %ecx,%ecx
+        0xC3
+    );
+
+    /* ------ Soundness: absorbed memory-source MOV2 addressed through RCX ------ */
+    // `mov %r8d,%ecx (MOV1); mov (%rcx),%eax (MOV2); shl %cl,%eax`. Absorbing
+    // MOV2 into SHLX deletes MOV1, so the SHLX (%rcx) memory operand would use a
+    // stale RCX. Must refuse.
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,        // movl %r8d,%ecx
+        0x8B, 0x01,              // movl (%rcx),%eax
+        0xD3, 0xE0,              // sall %cl,%eax
+        0xC3
+    );
+
     /* ================= ANDN tests ================= */
 
     #define CHECK_ANDN(expected, ...) \
@@ -663,6 +700,19 @@ int main(int argc, char *argv[])
         0xF7, 0xD0,            // not %eax
         0x21, 0xC3,            // and %eax, %ebx
         0x31, 0xC0,            // xor %eax, %eax
+        0xC3
+    );
+
+    /* Soundness: mask register read as a memory base before its kill must bail.
+       `not %rax; and %rax,%rbx; mov (%rax),%rdx; xor %rax,%rax` — ANDN leaves
+       %rax holding its original (un-negated) value, so the load address would
+       differ from the original code. The base use of %rax is a read. */
+    CHECK_ANDN(
+        0,
+        0x48, 0xF7, 0xD0,      // not %rax
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0x48, 0x8B, 0x10,      // mov (%rax), %rdx   (reads RAX as base)
+        0x48, 0x31, 0xC0,      // xor %rax, %rax
         0xC3
     );
 
