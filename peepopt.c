@@ -1015,6 +1015,15 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         xed_reg_enum_t mask_reg = and_src;
         xed_reg_enum_t other_reg = and_dst;
 
+        // The mask and the other operand must be distinct registers. For
+        // `and %reg,%reg` (and_src == and_dst) the rewrite would emit
+        // `andn %reg,%reg,%reg`, i.e. ~reg & reg == 0 unconditionally (and
+        // ZF forced to 1), whereas `not %reg; and %reg,%reg` leaves reg = ~reg.
+        if (xed_get_largest_enclosing_register(mask_reg) ==
+            xed_get_largest_enclosing_register(other_reg)) {
+            goto end;
+        }
+
         unsigned int eow = xed_get_register_width_bits(and_dst);
         if (eow != 32 && eow != 64) {
             goto end;

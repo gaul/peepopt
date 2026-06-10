@@ -716,5 +716,16 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* Soundness: `and %reg,%reg` must not fold. `not %rax; and %rax,%rax`
+       leaves rax = ~rax, but `andn %rax,%rax,%rax` is ~rax & rax == 0 (and
+       forces ZF=1). The mask and the other operand alias, so refuse. */
+    CHECK_ANDN(
+        0,
+        0x48, 0xF7, 0xD0,      // not %rax
+        0x48, 0x21, 0xC0,      // and %rax, %rax
+        0x48, 0x31, 0xC0,      // xor %rax, %rax
+        0xC3
+    );
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
