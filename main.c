@@ -113,6 +113,17 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // The decoder and rewriter assume x86-64. Decoding another architecture's
+    // executable sections as x86-64 and rewriting them in place would corrupt
+    // the file, so refuse anything that is not EM_X86_64.
+    if (elf_header->e_machine != EM_X86_64) {
+        fprintf(stderr, "not an x86-64 ELF file (e_machine=%u); refusing to rewrite\n",
+                (unsigned)elf_header->e_machine);
+        munmap(addr, file_size);
+        close(fd);
+        return 1;
+    }
+
     if (elf_header->e_shentsize < sizeof(Elf64_Shdr) ||
         elf_header->e_shoff > file_size ||
         (uint64_t)elf_header->e_shnum * elf_header->e_shentsize > file_size - elf_header->e_shoff ||
