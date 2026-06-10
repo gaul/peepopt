@@ -1029,6 +1029,16 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
             goto end;
         }
 
+        // The NOT and the AND must operate on the same width. A narrower NOT
+        // zero-extends its result into the wider register, so e.g.
+        // `not %eax; and %rax,%rbx` clears rbx[63:32]; folding to a 64-bit
+        // `andn` would instead read the full, un-zero-extended rax and leave
+        // those high bits set. (enclosing-register equality above is not
+        // enough -- it treats EAX and RAX as the same operand.)
+        if (xed_get_register_width_bits(not_reg) != eow) {
+            goto end;
+        }
+
         // Forward lookahead: mask_reg must be fully overwritten before any
         // read, and PF must be overwritten before any PF read.
         bool mask_killed = false;

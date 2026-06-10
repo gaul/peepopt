@@ -727,5 +727,16 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* Soundness: a 32-bit NOT must not fold into a 64-bit ANDN. `not %eax`
+       zero-extends, so `and %rax,%rbx` clears rbx[63:32]; a 64-bit
+       `andn %rbx,%rax,%rbx` reads the full rax and leaves those bits set. */
+    CHECK_ANDN(
+        0,
+        0xF7, 0xD0,            // not %eax           (32-bit, zero-extends)
+        0x48, 0x21, 0xC3,      // and %rax, %rbx     (64-bit)
+        0x48, 0x31, 0xC0,      // xor %rax, %rax
+        0xC3
+    );
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
