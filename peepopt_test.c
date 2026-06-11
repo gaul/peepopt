@@ -751,5 +751,86 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ ANDN pattern 1: NOT on AND's destination ------ */
+
+    /* `not %rbx; and %rax,%rbx` == rbx = ~rbx & rax == andn(rbx, rbx, rax).
+       Both versions overwrite rbx with the same value and leave rax alone,
+       so no register goes stale; only PF must die (RET kills flags). */
+    CHECK_ANDN(
+        1,
+        0x48, 0xF7, 0xD3,      // not %rbx
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0xC3                   // ret (kills flags)
+    );
+
+    /* Unlike pattern 2, reading the NOT'd register afterward is fine: the
+       rewrite leaves the identical value in it. */
+    CHECK_ANDN(
+        1,
+        0x48, 0xF7, 0xD3,      // not %rbx
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0x48, 0x89, 0xDA,      // mov %rbx, %rdx   (reads rbx — still OK)
+        0xC3
+    );
+
+    /* replace=true: verify encoded bytes. vvvv carries the inverted operand,
+       which for pattern 1 is the destination itself:
+         byte3 = W ~vvvv L pp = 1 1100 0 00 = 0xE0 (vvvv=RBX=3)
+         ModR/M = 11 reg=RBX=011 rm=RAX=000 = 0xD8 */
+    {
+        uint8_t bytes[] = {
+            0x48, 0xF7, 0xD3,  // not %rbx
+            0x48, 0x21, 0xC3,  // and %rax, %rbx
+            0xC3,
+        };
+        uint8_t expect[] = {
+            0xC4, 0xE2, 0xE0, 0xF2, 0xD8,  // andn %rbx, %rbx, %rax
+            0x90,                          // 1-byte NOP
+            0xC3,
+        };
+        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ true);
+        if (got != 1) {
+            fprintf(stderr, "%s:%d: check_andn returned %d, expected 1\n",
+                    __FILE__, __LINE__, got);
+            ++failures;
+        } else if (memcmp(bytes, expect, sizeof(bytes)) != 0) {
+            fprintf(stderr, "%s:%d: andn buffer mismatch\n", __FILE__, __LINE__);
+            fprintf(stderr, "  got:     ");
+            for (size_t i = 0; i < sizeof(bytes); ++i) fprintf(stderr, "%02X ", bytes[i]);
+            fprintf(stderr, "\n  expect:  ");
+            for (size_t i = 0; i < sizeof(expect); ++i) fprintf(stderr, "%02X ", expect[i]);
+            fprintf(stderr, "\n");
+            ++failures;
+        }
+    }
+
+    /* PF read after the pair must still bail in pattern 1. */
+    CHECK_ANDN(
+        0,
+        0x48, 0xF7, 0xD3,      // not %rbx
+        0x48, 0x21, 0xC3,      // and %rax, %rbx
+        0x0F, 0x9A, 0xC0,      // setp %al  (reads PF)
+        0xC3
+    );
+
+    /* 32-bit no-REX pattern 1 doesn't fit (4 bytes vs 5-byte ANDN). */
+    CHECK_ANDN(
+        0,
+        0xF7, 0xD3,            // not %ebx
+        0x21, 0xC3,            // and %eax, %ebx
+        0xC3
+    );
+
+    /* Soundness: a 32-bit NOT must not fold into a 64-bit ANDN in pattern 1
+       either. `not %ebx` zero-extends so the original computes
+       rbx = zext(~ebx) & rax, but `andn %rbx,%rbx,%rax` inverts the full
+       original rbx including its high bits. */
+    CHECK_ANDN(
+        0,
+        0xF7, 0xD3,            // not %ebx           (32-bit, zero-extends)
+        0x48, 0x21, 0xC3,      // and %rax, %rbx     (64-bit)
+        0xC3
+    );
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

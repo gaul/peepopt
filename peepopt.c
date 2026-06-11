@@ -1162,12 +1162,20 @@ static const struct inst_history_entry *find_adjacent_not(
     return e;
 }
 
-// Rewrite `not %reg_A; and %reg_A, %reg_B` as `andn %reg_A, %reg_B, %reg_B`.
-// ANDN reads the un-negated value of reg_A directly, so after the rewrite
-// reg_A holds its original value rather than the inverted one; we refuse
-// unless reg_A is overwritten before any subsequent read. ANDN also leaves PF
-// undefined whereas AND sets it based on the result, so PF must be clobbered
-// before any read. CF/OF/SF/ZF are written identically by both.
+// Rewrite a reg-form NOT feeding an adjacent AND as a single BMI1 ANDN
+// (dst = ~inverted & other). Two shapes are handled:
+//
+//   Pattern 2: not %A; and %A,%B  ->  B = ~A & B
+//     ANDN reads the un-negated A, so after the rewrite A holds its original
+//     value rather than the inverted one; refuse unless A is fully
+//     overwritten before any subsequent read.
+//   Pattern 1: not %B; and %A,%B  ->  B = ~B & A
+//     The inverted register is the AND destination, which the original pair
+//     and the ANDN overwrite with the same value, so no register goes stale.
+//
+// Either way ANDN leaves PF undefined whereas AND sets it based on the
+// result, so PF must be clobbered before any read. CF/OF/SF/ZF are written
+// identically by both.
 static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
                             const uint8_t *branch_targets)
 {
@@ -1253,18 +1261,25 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
             goto end;
         }
 
-        // We currently handle pattern 2 only: NOT's register is AND's R-only
-        // source. The other case (NOT's register == AND's dst) is rarer and
-        // less clean to encode (REG0 and REG1 would share a register).
-        if (xed_get_largest_enclosing_register(not_reg) !=
-            xed_get_largest_enclosing_register(and_src)) {
-            stat_reason = xed_get_largest_enclosing_register(not_reg) ==
-                          xed_get_largest_enclosing_register(and_dst) ?
-                    STAT_UNIMPLEMENTED_VARIANT : STAT_DEF_REG_UNRELATED;
+        // Dispatch on which AND operand the NOT produced. mask_reg is the
+        // operand ANDN inverts (VEX.vvvv); other_reg is the plain source.
+        // Only pattern 2 leaves a stale register behind (see above).
+        xed_reg_enum_t mask_reg;
+        xed_reg_enum_t other_reg;
+        bool need_mask_dead;
+        xed_reg_enum_t not_family = xed_get_largest_enclosing_register(not_reg);
+        if (not_family == xed_get_largest_enclosing_register(and_src)) {
+            mask_reg = and_src;
+            other_reg = and_dst;
+            need_mask_dead = true;
+        } else if (not_family == xed_get_largest_enclosing_register(and_dst)) {
+            mask_reg = and_dst;
+            other_reg = and_src;
+            need_mask_dead = false;
+        } else {
+            stat_reason = STAT_DEF_REG_UNRELATED;
             goto end;
         }
-        xed_reg_enum_t mask_reg = and_src;
-        xed_reg_enum_t other_reg = and_dst;
 
         // The mask and the other operand must be distinct registers. For
         // `and %reg,%reg` (and_src == and_dst) the rewrite would emit
@@ -1293,9 +1308,10 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
             goto end;
         }
 
-        // Forward lookahead: mask_reg must be fully overwritten before any
-        // read, and PF must be overwritten before any PF read.
-        bool mask_killed = false;
+        // Forward lookahead: in pattern 2 mask_reg must be fully overwritten
+        // before any read; in both patterns PF must be overwritten before any
+        // PF read. Pattern 1 starts with the register requirement satisfied.
+        bool mask_killed = !need_mask_dead;
         uint32_t killed_flags = 0;
         size_t new_offset = offset + xed_decoded_inst_get_length(&xedd);
         for (int i = 0; i < 16 && new_offset < len; i++) {
