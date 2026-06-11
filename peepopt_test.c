@@ -433,14 +433,95 @@ int main(int argc, char *argv[])
         check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
     }
 
-    /* ------ Non-adjacent MOV1 with unrecognized gap must bail ------ */
-    // `mov %r8d,%ecx; xor %edi,%edi; shl %cl,%eax` — intervening XOR is not
-    // a MOV that sets shift_dst and cannot be absorbed. Must refuse rewrite.
+    /* ------ Non-adjacent MOV1 with a non-MOV2 gap: repacked ------ */
+    // `mov %r8d,%ecx; xor %edi,%edi; shl %cl,%eax` — the XOR cannot be
+    // absorbed, but it touches neither RCX nor %r8d, so it slides down over
+    // MOV1 and SHLX takes the 5 bytes MOV1+SHL occupied (exact fit).
+    {
+        uint8_t bytes[] = {
+            0x44, 0x89, 0xC1,   // movl %r8d,%ecx
+            0x31, 0xFF,         // xor %edi,%edi
+            0xD3, 0xE0,         // sall %cl,%eax
+            0xC3,               // ret
+        };
+        uint8_t expect[] = {
+            0x31, 0xFF,                     // xor %edi,%edi (moved down 3)
+            0xC4, 0xE2, 0x39, 0xF7, 0xC0,   // shlxl %r8d,%eax,%eax
+            0xC3,
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
+    /* Gap instruction overwriting the count source must refuse: SHLX would
+       read %r8d after the increment; the original SHL used the value MOV1
+       captured before it. */
     CHECK_BYTES(
         0,
         0x44, 0x89, 0xC1,   // movl %r8d,%ecx
+        0x41, 0xFF, 0xC0,   // inc %r8d   (clobbers count source)
+        0xD3, 0xE0,         // sall %cl,%eax
+        0xC3
+    );
+
+    /* RIP-relative gap instruction: the store slides down 3 bytes, so its
+       displacement grows by 3 to keep addressing the same location. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF1,                    // movq %rsi,%rcx
+            0x89, 0x3D, 0x10, 0x00, 0x00, 0x00,  // movl %edi,0x10(%rip)
+            0x48, 0xD3, 0xE0,                    // shlq %cl,%rax
+            0xC3,
+        };
+        uint8_t expect[] = {
+            0x89, 0x3D, 0x13, 0x00, 0x00, 0x00,  // movl %edi,0x13(%rip)
+            0xC4, 0xE2, 0xC9, 0xF7, 0xC0,        // shlxq %rsi,%rax,%rax
+            0x90,                                // 1-byte NOP
+            0xC3,
+        };
+        check_replace(__LINE__, 1, expect, sizeof(expect), bytes, sizeof(bytes));
+    }
+
+    /* Two-instruction gap repacks too. */
+    CHECK_BYTES(
+        1,
+        0x48, 0x89, 0xF1,   // movq %rsi,%rcx
+        0x31, 0xFF,         // xor %edi,%edi
+        0x83, 0xC2, 0x05,   // addl $5,%edx
+        0x48, 0xD3, 0xE0,   // shlq %cl,%rax
+        0xC3
+    );
+
+    /* The repacked gap keeps its bytes: SHLX must fit in MOV1+SHL alone.
+       2-byte MOV1 + 2-byte SHL = 4 < 5, so this must refuse even though the
+       whole range including the gap is 6 bytes. */
+    CHECK_BYTES(
+        0,
+        0x89, 0xF1,         // movl %esi,%ecx
         0x31, 0xFF,         // xor %edi,%edi
         0xD3, 0xE0,         // sall %cl,%eax
+        0x31, 0xC9,         // xor %ecx,%ecx
+        0xC3
+    );
+
+    /* A branch target inside the moved gap must refuse the rewrite. */
+    CHECK_BYTES(
+        0,
+        0xEB, 0x03,         // jmp .+3 (targets the xor below)
+        0x48, 0x89, 0xF1,   // movq %rsi,%rcx
+        0x31, 0xFF,         // xor %edi,%edi   <- branch target
+        0x48, 0xD3, 0xE0,   // shlq %cl,%rax
+        0xC3
+    );
+
+    /* A writer nine instructions back sits beyond the old 8-entry history
+       window; the widened window finds it and the long gap repacks. */
+    CHECK_BYTES(
+        1,
+        0x48, 0x89, 0xF1,   // movq %rsi,%rcx
+        0x31, 0xFF, 0x31, 0xFF, 0x31, 0xFF,  // xor %edi,%edi x3
+        0x31, 0xFF, 0x31, 0xFF, 0x31, 0xFF,  // xor %edi,%edi x3
+        0x31, 0xFF, 0x31, 0xFF, 0x31, 0xFF,  // xor %edi,%edi x3 (9 total)
+        0x48, 0xD3, 0xE0,   // shlq %cl,%rax
         0xC3
     );
 

@@ -89,7 +89,7 @@ static const char *const stat_names[STAT_COUNT] = {
     [STAT_SRC_DST_SAME]            = "source and destination are the same",
     [STAT_WIDTH_NOT_32_64]         = "operand width not 32/64-bit",
     [STAT_WIDTH_MISMATCH]          = "operand widths differ",
-    [STAT_GAP_NOT_ABSORBABLE]      = "gap to writer not absorbable",
+    [STAT_GAP_NOT_ABSORBABLE]      = "gap not absorbable or repackable",
     [STAT_LOOKAHEAD_BRANCH]        = "branch during forward lookahead",
     [STAT_REG_READ_AFTER]          = "stale register read after rewrite point",
     [STAT_FLAGS_READ_AFTER]        = "stale flag read after rewrite point",
@@ -182,7 +182,9 @@ void peepopt_print_stats(void)
     }
 }
 
-#define HISTORY_SIZE 8
+// Backward window for finding the count-register writer. Gap repacking makes
+// distant writers usable, so the window is sized well past typical gaps.
+#define HISTORY_SIZE 32
 
 struct inst_history_entry {
     xed_decoded_inst_t xedd;
@@ -524,6 +526,126 @@ static bool kills_reg_full(const xed_decoded_inst_t *xedd, xed_reg_enum_t query)
     return full_write && !any_read;
 }
 
+// A RIP-relative memory operand stores target - end_of_instruction in a
+// 4-byte displacement that is the last field before any trailing immediate.
+// Returns the displacement's byte offset within the instruction, or -1 when
+// the layout is not the expected patchable form.
+static int rip_disp32_pos(const xed_decoded_inst_t *xedd)
+{
+    if (xed_decoded_inst_get_memory_displacement_width(xedd, 0) != 4) {
+        return -1;
+    }
+    int len = (int)xed_decoded_inst_get_length(xedd);
+    int imm_bytes = (int)xed_decoded_inst_get_immediate_width_bits(xedd) / 8;
+    int pos = len - imm_bytes - 4;
+    // A RIP-relative form needs at least an opcode and a ModRM byte first.
+    return pos >= 2 ? pos : -1;
+}
+
+// Decide whether the instructions between a non-adjacent MOV1 (at history
+// distance mov_dist) and the shift can slide down over MOV1's bytes ("gap
+// repacking"). The backward scan already guarantees the gap touches no RCX
+// alias -- a write would have made that instruction the count writer, a read
+// would have blocked the def-use chain. What remains:
+//  * the history entries must be byte-contiguous from MOV1 to the shift,
+//  * no gap instruction may write count_src's register family: SHLX reads
+//    the count after the gap, where MOV1 read it before the gap, and
+//  * each RIP-relative gap instruction needs a patchable disp32, proven by
+//    patching a copy and re-decoding it before any real bytes change.
+static bool gap_is_repackable(const struct inst_history *h, size_t mov_dist,
+                              size_t shift_offset, xed_reg_enum_t count_src,
+                              const uint8_t *inst)
+{
+    const struct inst_history_entry *mov_entry = history_at(h, mov_dist);
+    size_t mov1_len = xed_decoded_inst_get_length(&mov_entry->xedd);
+    size_t expect = mov_entry->offset + mov1_len;
+    for (size_t dist = mov_dist - 1; dist >= 1; dist--) {
+        const struct inst_history_entry *e = history_at(h, dist);
+        if (e->offset != expect) {
+            return false;
+        }
+        unsigned int e_len = xed_decoded_inst_get_length(&e->xedd);
+        expect += e_len;
+
+        bool w = false, r = false;
+        inst_touches_reg(&e->xedd, count_src, &w, &r);
+        if (w) {
+            VLOG("Gap instruction overwrites the SHLX count source; cannot repack\n");
+            return false;
+        }
+
+        unsigned int nmem = xed_decoded_inst_number_of_memory_operands(&e->xedd);
+        for (unsigned int m = 0; m < nmem; m++) {
+            xed_reg_enum_t base = xed_decoded_inst_get_base_reg(&e->xedd, m);
+            if (base != XED_REG_RIP && base != XED_REG_EIP) {
+                continue;
+            }
+            // RIP addressing only exists in the ModR/M (first) memory
+            // operand and EIP cannot occur in 64-bit code; refuse anything
+            // unexpected rather than patch it.
+            if (base == XED_REG_EIP || m != 0) {
+                return false;
+            }
+            int pos = rip_disp32_pos(&e->xedd);
+            if (pos < 0) {
+                return false;
+            }
+            int64_t disp = xed_decoded_inst_get_memory_displacement(&e->xedd, 0);
+            int64_t new_disp = disp + (int64_t)mov1_len;
+            if (new_disp < INT32_MIN || new_disp > INT32_MAX) {
+                return false;
+            }
+            // Prove the displacement position arithmetic on a copy before
+            // any real bytes change.
+            uint8_t tmp[XED_MAX_INSTRUCTION_BYTES];
+            memcpy(tmp, inst + e->offset, e_len);
+            tmp[pos]     = (uint8_t)(new_disp & 0xFF);
+            tmp[pos + 1] = (uint8_t)((new_disp >> 8) & 0xFF);
+            tmp[pos + 2] = (uint8_t)((new_disp >> 16) & 0xFF);
+            tmp[pos + 3] = (uint8_t)((new_disp >> 24) & 0xFF);
+            xed_decoded_inst_t chk;
+            xed_decoded_inst_zero(&chk);
+            xed_decoded_inst_set_mode(&chk, XED_MACHINE_MODE_LONG_64,
+                                      XED_ADDRESS_WIDTH_64b);
+            if (xed_decode(&chk, tmp, e_len) != XED_ERROR_NONE ||
+                xed_decoded_inst_get_length(&chk) != e_len ||
+                xed_decoded_inst_get_iclass(&chk) !=
+                        xed_decoded_inst_get_iclass(&e->xedd) ||
+                xed_decoded_inst_get_memory_displacement(&chk, 0) != new_disp) {
+                return false;
+            }
+        }
+    }
+    return expect == shift_offset;
+}
+
+// Slide the validated gap down over MOV1 and retarget each RIP-relative
+// disp32: the instruction moved mov1_len bytes lower, so the distance to its
+// (fixed) target grows by mov1_len.
+static void repack_gap(uint8_t *inst, const struct inst_history *h,
+                       size_t mov_dist, size_t mov1_len, size_t gap_len)
+{
+    const struct inst_history_entry *mov_entry = history_at(h, mov_dist);
+    memmove(inst + mov_entry->offset,
+            inst + mov_entry->offset + mov1_len, gap_len);
+    for (size_t dist = mov_dist - 1; dist >= 1; dist--) {
+        const struct inst_history_entry *e = history_at(h, dist);
+        if (xed_decoded_inst_number_of_memory_operands(&e->xedd) == 0 ||
+            xed_decoded_inst_get_base_reg(&e->xedd, 0) != XED_REG_RIP) {
+            continue;
+        }
+        int pos = rip_disp32_pos(&e->xedd);
+        int64_t new_disp =
+                xed_decoded_inst_get_memory_displacement(&e->xedd, 0) +
+                (int64_t)mov1_len;
+        uint8_t *p = inst + e->offset - mov1_len + pos;
+        p[0] = (uint8_t)(new_disp & 0xFF);
+        p[1] = (uint8_t)((new_disp >> 8) & 0xFF);
+        p[2] = (uint8_t)((new_disp >> 16) & 0xFF);
+        p[3] = (uint8_t)((new_disp >> 24) & 0xFF);
+    }
+}
+
 static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                               const uint8_t *branch_targets);
 
@@ -684,11 +806,11 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 goto end;
             }
             // MOV1's offset vs. the shift determines the rewrite layout:
-            //   adjacent: [MOV1][SHIFT]           -> SHLX consumes MOV1+SHIFT
-            //   gap:      [MOV1][GAP][SHIFT]      -> only rewritable if the GAP
-            //                                        is exactly one MOV that
-            //                                        sets shift_dst (handled as
-            //                                        MOV2 absorption below).
+            //   adjacent: [MOV1][SHIFT]      -> SHLX consumes MOV1+SHIFT
+            //   gap:      [MOV1][GAP][SHIFT] -> the GAP is either absorbed
+            //                                   into SHLX (a single MOV that
+            //                                   sets shift_dst) or repacked
+            //                                   down over MOV1's bytes.
             size_t mov1_len_for_gap = xed_decoded_inst_get_length(xedd_old);
             bool mov1_adjacent = (mov_entry->offset + mov1_len_for_gap == offset);
 
@@ -911,14 +1033,34 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 }
             }
 
-            // Non-adjacent MOV1 is only safe when the intervening gap was
-            // entirely filled by an absorbable MOV2.
+            // Non-adjacent MOV1 whose gap is not an absorbable MOV2: repack
+            // instead. The gap provably touches no RCX alias (the backward
+            // scan would have classified the site differently), so its bytes
+            // can slide down over MOV1 unchanged -- execution order relative
+            // to everything but the deleted MOV1 is preserved, and MOV1
+            // writes only RCX and no flags. SHLX then goes where the shift
+            // was, reading the count from mov_src at that point, which is
+            // why the gap must not overwrite mov_src.
+            size_t repack_gap_len = 0;
+            size_t repack_mov_dist = 0;
             if (!mov1_adjacent && shlx_rm == shift_dst && mov2_mem_source == NULL) {
-                VLOG("MOV1 at offset %zu is %zu bytes before shift and gap is not an absorbable MOV2; skipping\n",
-                        mov_entry->offset,
-                        offset - mov_entry->offset - mov1_len_for_gap);
-                stat_reason = STAT_GAP_NOT_ABSORBABLE;
-                goto end;
+                for (size_t d = 1; d <= history.count; d++) {
+                    if (history_at(&history, d) == mov_entry) {
+                        repack_mov_dist = d;
+                        break;
+                    }
+                }
+                if (repack_mov_dist < 2 ||
+                    !gap_is_repackable(&history, repack_mov_dist, offset,
+                                       mov_src, inst)) {
+                    VLOG("MOV1 at offset %zu is %zu bytes before shift and gap is not absorbable or repackable; skipping\n",
+                            mov_entry->offset,
+                            offset - mov_entry->offset - mov1_len_for_gap);
+                    stat_reason = STAT_GAP_NOT_ABSORBABLE;
+                    goto end;
+                }
+                repack_gap_len = offset - mov_entry->offset - mov1_len_for_gap;
+                VLOG("Repacking %zu gap bytes over MOV1\n", repack_gap_len);
             }
 
             VLOG("Higher confidence\n");
@@ -1048,8 +1190,12 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 }
 
                 unsigned int old_len = (offset + xed_decoded_inst_get_length(&xedd)) - rewrite_offset;
-                VLOG("Replacement instruction is %u bytes and original instructions are %u bytes\n", new_len, old_len);
-                if (new_len > old_len) {
+                // Repacked gap bytes stay in place, so SHLX must fit in what
+                // MOV1 and the shift alone occupied.
+                unsigned int shlx_budget = old_len - (unsigned int)repack_gap_len;
+                VLOG("Replacement instruction is %u bytes and original instructions are %u bytes (%u available)\n",
+                        new_len, old_len, shlx_budget);
+                if (new_len > shlx_budget) {
                     VLOG("Cannot replace instructions since replacement is too large\n");
                     stat_reason = STAT_TOO_LONG;
                     goto end;
@@ -1084,10 +1230,15 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
 
                 if (replace) {
                     uint8_t *addr = inst + rewrite_offset;
+                    if (repack_gap_len > 0) {
+                        repack_gap(inst, &history, repack_mov_dist,
+                                   mov1_len_for_gap, repack_gap_len);
+                        addr += repack_gap_len;
+                    }
                     memcpy(addr, new_bytes, new_len);
 
-                    if (old_len - new_len > 0) {
-                        err = xed_encode_nop(addr + new_len, old_len - new_len);
+                    if (shlx_budget - new_len > 0) {
+                        err = xed_encode_nop(addr + new_len, shlx_budget - new_len);
                         if (err != XED_ERROR_NONE) {
                             fprintf(stderr, "Could not encode no-ops: %s\n", xed_error_enum_t2str(err));
                             return -1;
