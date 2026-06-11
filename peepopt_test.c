@@ -913,5 +913,133 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ================= VEX three-operand tests ================= */
+
+    #define CHECK_VEX3(expected, ...) \
+    do { \
+        uint8_t bytes[] = { __VA_ARGS__ }; \
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ false); \
+        if (got != (expected)) { \
+            fprintf(stderr, "%s:%d: check_vex3 returned %d, expected %d\n", \
+                    __FILE__, __LINE__, got, (expected)); \
+            ++failures; \
+        } \
+    } while (0)
+
+    /* `movaps %xmm1,%xmm2; addss %xmm3,%xmm2` == xmm2 = xmm1 + xmm3 with
+       xmm2[127:32] from xmm1 == `vaddss %xmm3,%xmm1,%xmm2`. No liveness or
+       trailing context is required at all — the pair alone rewrites. */
+    {
+        uint8_t bytes[] = {
+            0x0F, 0x28, 0xD1,        // movaps %xmm1,%xmm2
+            0xF3, 0x0F, 0x58, 0xD3,  // addss  %xmm3,%xmm2
+        };
+        uint8_t expect[] = {
+            0xC5, 0xF2, 0x58, 0xD3,  // vaddss %xmm3,%xmm1,%xmm2
+            0x0F, 0x1F, 0x00,        // 3-byte NOP
+        };
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        if (got != 1) {
+            fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
+                    __FILE__, __LINE__, got);
+            ++failures;
+        } else if (memcmp(bytes, expect, sizeof(bytes)) != 0) {
+            fprintf(stderr, "%s:%d: vex3 buffer mismatch\n", __FILE__, __LINE__);
+            fprintf(stderr, "  got:     ");
+            for (size_t i = 0; i < sizeof(bytes); ++i) fprintf(stderr, "%02X ", bytes[i]);
+            fprintf(stderr, "\n  expect:  ");
+            for (size_t i = 0; i < sizeof(expect); ++i) fprintf(stderr, "%02X ", expect[i]);
+            fprintf(stderr, "\n");
+            ++failures;
+        }
+    }
+
+    /* Non-commutative op: the copy source must land in VEX.vvvv (the minuend
+       slot). vsubss %xmm7,%xmm5,%xmm0 = xmm5 - xmm7; vvvv=xmm5 -> 0xD2. */
+    {
+        uint8_t bytes[] = {
+            0x0F, 0x28, 0xC5,        // movaps %xmm5,%xmm0
+            0xF3, 0x0F, 0x5C, 0xC7,  // subss  %xmm7,%xmm0
+        };
+        uint8_t expect[] = {
+            0xC5, 0xD2, 0x5C, 0xC7,  // vsubss %xmm7,%xmm5,%xmm0
+            0x0F, 0x1F, 0x00,        // 3-byte NOP
+        };
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        if (got != 1) {
+            fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
+                    __FILE__, __LINE__, got);
+            ++failures;
+        } else if (memcmp(bytes, expect, sizeof(bytes)) != 0) {
+            fprintf(stderr, "%s:%d: vex3 buffer mismatch\n", __FILE__, __LINE__);
+            fprintf(stderr, "  got:     ");
+            for (size_t i = 0; i < sizeof(bytes); ++i) fprintf(stderr, "%02X ", bytes[i]);
+            fprintf(stderr, "\n  expect:  ");
+            for (size_t i = 0; i < sizeof(expect); ++i) fprintf(stderr, "%02X ", expect[i]);
+            fprintf(stderr, "\n");
+            ++failures;
+        }
+    }
+
+    /* Packed integer via MOVDQA: vpaddd %xmm3,%xmm1,%xmm2. */
+    CHECK_VEX3(
+        1,
+        0x66, 0x0F, 0x6F, 0xD1,  // movdqa %xmm1,%xmm2
+        0x66, 0x0F, 0xFE, 0xD3,  // paddd  %xmm3,%xmm2
+        0xC3
+    );
+
+    /* Copy feeding a different register is not a candidate. */
+    CHECK_VEX3(
+        0,
+        0x0F, 0x28, 0xE1,        // movaps %xmm1,%xmm4
+        0xF3, 0x0F, 0x58, 0xD3,  // addss  %xmm3,%xmm2
+        0xC3
+    );
+
+    /* MOVSS reg,reg merges [31:0] only (xmm2[127:32] keeps its old value),
+       so it must not be treated as a full copy. */
+    CHECK_VEX3(
+        0,
+        0xF3, 0x0F, 0x10, 0xD1,  // movss %xmm1,%xmm2
+        0xF3, 0x0F, 0x58, 0xD3,  // addss %xmm3,%xmm2
+        0xC3
+    );
+
+    /* Memory-source ops are not yet folded. */
+    CHECK_VEX3(
+        0,
+        0x0F, 0x28, 0xD1,        // movaps %xmm1,%xmm2
+        0xF3, 0x0F, 0x58, 0x17,  // addss (%rdi),%xmm2
+        0xC3
+    );
+
+    /* High registers force the three-byte VEX form; still fits. */
+    CHECK_VEX3(
+        1,
+        0x45, 0x0F, 0x28, 0xD0,  // movaps %xmm8,%xmm10
+        0xF3, 0x45, 0x0F, 0x58, 0xD1,  // addss %xmm9,%xmm10
+        0xC3
+    );
+
+    /* Op source == op destination reads the copied value, so the rewrite
+       must substitute the copy source: pxor %xmm2,%xmm2 after the copy
+       computes xmm1^xmm1, not xmm1^xmm2_orig. */
+    CHECK_VEX3(
+        1,
+        0x66, 0x0F, 0x6F, 0xD1,  // movdqa %xmm1,%xmm2
+        0x66, 0x0F, 0xEF, 0xD2,  // pxor   %xmm2,%xmm2
+        0xC3
+    );
+
+    /* A branch target between copy and op must refuse. */
+    CHECK_VEX3(
+        0,
+        0xEB, 0x03,              // jmp .+3 (targets the addss below)
+        0x0F, 0x28, 0xD1,        // movaps %xmm1,%xmm2
+        0xF3, 0x0F, 0x58, 0xD3,  // addss  %xmm3,%xmm2   <- branch target
+        0xC3
+    );
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -197,6 +197,14 @@ int main(int argc, char **argv)
             return 1;
         }
         rewrites += andn_rewrites;
+        int vex3_rewrites = check_vex3(buf, section_header->sh_size, /*replace=*/ !dry_run);
+        if (vex3_rewrites < 0) {
+            fprintf(stderr, "check_vex3 failed on section %u\n", idx);
+            munmap(addr, file_size);
+            close(fd);
+            return 1;
+        }
+        rewrites += vex3_rewrites;
     }
 
     if (stats) {

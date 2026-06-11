@@ -101,8 +101,9 @@ static const char *const stat_names[STAT_COUNT] = {
 };
 
 // Far above the number of distinct anchor iclasses any plausible rule set
-// uses; rows past the cap are silently dropped.
-#define STAT_MAX_ROWS 32
+// uses (the VEX pass alone anchors on ~90); rows past the cap are silently
+// dropped.
+#define STAT_MAX_ROWS 192
 
 struct stat_row {
     xed_iclass_enum_t iclass;
@@ -1559,6 +1560,307 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
 end:
         if (stat_reason >= 0) {
             stat_record(XED_ICLASS_AND, stat_reason);
+        }
+        if (is_basic_block_terminator(&xedd)) {
+            history_reset(&history);
+        } else {
+            history_push(&history, &xedd, offset);
+        }
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+    return count;
+}
+
+// Legacy two-operand SSE instructions paired with their AVX three-operand
+// VEX.128 forms. Every entry reads its destination as the first source and
+// writes nothing but the destination XMM register (plus MXCSR for FP ops,
+// identically in both encodings). Instructions with immediates (SHUFPS,
+// CMPPS, PSLLW-by-imm, ...), implicit operands (BLENDVPS), or merging
+// destinations (SQRTSS, CVT*, MOVSS) do not belong here.
+static const struct {
+    xed_iclass_enum_t legacy;
+    xed_iclass_enum_t vex;
+} vex3_rules[] = {
+#define R(x) { XED_ICLASS_##x, XED_ICLASS_V##x }
+    R(ADDSS), R(ADDSD), R(ADDPS), R(ADDPD),
+    R(SUBSS), R(SUBSD), R(SUBPS), R(SUBPD),
+    R(MULSS), R(MULSD), R(MULPS), R(MULPD),
+    R(DIVSS), R(DIVSD), R(DIVPS), R(DIVPD),
+    R(MINSS), R(MINSD), R(MINPS), R(MINPD),
+    R(MAXSS), R(MAXSD), R(MAXPS), R(MAXPD),
+    R(ANDPS), R(ANDPD), R(ANDNPS), R(ANDNPD),
+    R(ORPS), R(ORPD), R(XORPS), R(XORPD),
+    R(UNPCKLPS), R(UNPCKLPD), R(UNPCKHPS), R(UNPCKHPD),
+    R(PAND), R(PANDN), R(POR), R(PXOR),
+    R(PADDB), R(PADDW), R(PADDD), R(PADDQ),
+    R(PSUBB), R(PSUBW), R(PSUBD), R(PSUBQ),
+    R(PADDSB), R(PADDSW), R(PADDUSB), R(PADDUSW),
+    R(PSUBSB), R(PSUBSW), R(PSUBUSB), R(PSUBUSW),
+    R(PMULLW), R(PMULHW), R(PMULHUW), R(PMULUDQ),
+    R(PMINSW), R(PMINUB), R(PMAXSW), R(PMAXUB),
+    R(PCMPEQB), R(PCMPEQW), R(PCMPEQD),
+    R(PCMPGTB), R(PCMPGTW), R(PCMPGTD),
+    R(PUNPCKLBW), R(PUNPCKLWD), R(PUNPCKLDQ), R(PUNPCKLQDQ),
+    R(PUNPCKHBW), R(PUNPCKHWD), R(PUNPCKHDQ), R(PUNPCKHQDQ),
+    R(PACKSSWB), R(PACKSSDW), R(PACKUSWB),
+    R(PAVGB), R(PAVGW), R(PSADBW), R(PMADDWD),
+    R(PSLLW), R(PSLLD), R(PSLLQ),
+    R(PSRLW), R(PSRLD), R(PSRLQ), R(PSRAW), R(PSRAD),
+#undef R
+};
+
+static xed_iclass_enum_t vex3_vex_iclass(int iclass)
+{
+    static xed_iclass_enum_t map[XED_ICLASS_LAST];
+    static bool init;
+    if (!init) {
+        for (size_t i = 0; i < sizeof(vex3_rules) / sizeof(vex3_rules[0]); i++) {
+            map[vex3_rules[i].legacy] = vex3_rules[i].vex;
+        }
+        init = true;
+    }
+    if (iclass <= 0 || iclass >= XED_ICLASS_LAST) {
+        return XED_ICLASS_INVALID;
+    }
+    return map[iclass];
+}
+
+// Probe for an adjacent preceding full-width XMM register copy. MOVSS/MOVSD
+// register forms merge into the destination's low lanes rather than copying
+// all 128 bits, so they do not qualify.
+static const struct inst_history_entry *find_adjacent_xmm_copy(
+        const struct inst_history *h, size_t offset,
+        xed_reg_enum_t *copy_src, xed_reg_enum_t *copy_dst)
+{
+    *copy_src = XED_REG_INVALID;
+    *copy_dst = XED_REG_INVALID;
+    const struct inst_history_entry *e = history_at(h, 1);
+    if (e == NULL ||
+        e->offset + xed_decoded_inst_get_length(&e->xedd) != offset ||
+        xed_decoded_inst_number_of_memory_operands(&e->xedd) != 0) {
+        return NULL;
+    }
+    switch (xed_decoded_inst_get_iclass(&e->xedd)) {
+    case XED_ICLASS_MOVAPS:
+    case XED_ICLASS_MOVAPD:
+    case XED_ICLASS_MOVUPS:
+    case XED_ICLASS_MOVUPD:
+    case XED_ICLASS_MOVDQA:
+    case XED_ICLASS_MOVDQU:
+        break;
+    default:
+        return NULL;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(&e->xedd);
+    unsigned int n = xed_inst_noperands(xi);
+    for (unsigned int i = 0; i < n; i++) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        if (!xed_operand_is_register(xed_operand_name(op))) {
+            return NULL;
+        }
+        xed_reg_enum_t reg = xed_decoded_inst_get_reg(&e->xedd,
+                                                      xed_operand_name(op));
+        if (xed_reg_class(reg) != XED_REG_CLASS_XMM) {
+            return NULL;
+        }
+        xed_operand_action_enum_t act = xed_operand_rw(op);
+        if (act == XED_OPERAND_ACTION_W) {
+            *copy_dst = reg;
+        } else if (act == XED_OPERAND_ACTION_R) {
+            *copy_src = reg;
+        } else {
+            return NULL;
+        }
+    }
+    if (*copy_src == XED_REG_INVALID || *copy_dst == XED_REG_INVALID) {
+        return NULL;
+    }
+    return e;
+}
+
+static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
+                            const uint8_t *branch_targets);
+
+int check_vex3(uint8_t *inst, size_t len, bool replace)
+{
+    size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
+    uint8_t *targets = calloc(bitmap_bytes, 1);
+    if (targets == NULL) {
+        return -1;
+    }
+    collect_branch_targets(inst, len, targets);
+    int result = check_vex3_impl(inst, len, replace, targets);
+    free(targets);
+    return result;
+}
+
+// Rewrite an XMM register copy feeding an adjacent two-operand SSE op as the
+// op's VEX three-operand form:
+//
+//   movaps %a,%c; op %b,%c   ->   vop %b,%a,%c   (c = a OP b)
+//
+// The legacy op reads its destination as the first source; the VEX form
+// makes that source explicit, so the copy folds away. Unlike the shift and
+// ANDN rewrites this needs no forward liveness at all: neither instruction
+// touches EFLAGS, a and b hold the same values afterward in both versions,
+// and c receives the identical result, including scalar-op merge semantics
+// (vaddss fills the upper lanes from its first source exactly as the movaps
+// did).
+//
+// The only architectural difference is that VEX-encoded ops zero the
+// destination's YMM/ZMM bits above 127 where legacy SSE preserves them.
+// SSE-only code cannot read those bits and the SysV ABI makes every vector
+// register call-clobbered, so no conforming code can observe the change.
+// VEX.128 writes also leave the AVX upper state clean, avoiding SSE/AVX
+// transition penalties.
+static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
+                            const uint8_t *branch_targets)
+{
+    int count = 0;
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    struct inst_history history;
+    history_reset(&history);
+
+    for (size_t offset = 0; offset < len;) {
+        int stat_reason = -1;
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+
+        xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
+        if (err != XED_ERROR_NONE) {
+            fprintf(stderr, "Decoding error at offset: %zu: %s\n", offset,
+                    xed_error_enum_t2str(err));
+            return -1;
+        }
+
+        int iclass = xed_decoded_inst_get_iclass(&xedd);
+        xed_iclass_enum_t vex_iclass = vex3_vex_iclass(iclass);
+        if (vex_iclass == XED_ICLASS_INVALID) {
+            goto end;
+        }
+
+        // Extract the op's register operands tolerantly so memory-source
+        // forms still yield op_dst for candidate accounting. MXCSR is an FP
+        // side effect identical in the VEX form; skip it like ANDN skips
+        // EFLAGS.
+        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+        unsigned int n = xed_inst_noperands(xi);
+        xed_reg_enum_t op_dst = XED_REG_INVALID;
+        xed_reg_enum_t op_src = XED_REG_INVALID;
+        bool form_ok = true;
+        for (unsigned int i = 0; i < n; i++) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t op_name = xed_operand_name(op);
+            if (!xed_operand_is_register(op_name)) {
+                continue;  // memory operand pieces; the nmem check rejects
+            }
+            xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd, op_name);
+            if (reg == XED_REG_MXCSR) {
+                continue;
+            }
+            xed_operand_action_enum_t act = xed_operand_rw(op);
+            if (xed_reg_class(reg) != XED_REG_CLASS_XMM) {
+                form_ok = false;
+            } else if (act == XED_OPERAND_ACTION_RW) {
+                if (op_dst != XED_REG_INVALID) {
+                    form_ok = false;
+                }
+                op_dst = reg;
+            } else if (act == XED_OPERAND_ACTION_R) {
+                if (op_src != XED_REG_INVALID) {
+                    form_ok = false;
+                }
+                op_src = reg;
+            } else {
+                form_ok = false;
+            }
+        }
+
+        {
+            xed_reg_enum_t copy_src = XED_REG_INVALID;
+            xed_reg_enum_t copy_dst = XED_REG_INVALID;
+            const struct inst_history_entry *copy_entry =
+                    find_adjacent_xmm_copy(&history, offset, &copy_src, &copy_dst);
+            if (copy_entry == NULL || op_dst == XED_REG_INVALID ||
+                copy_dst != op_dst) {
+                goto end;
+            }
+            stat_candidate(iclass);
+            if (xed_decoded_inst_number_of_memory_operands(&xedd) != 0 ||
+                xed_decoded_inst_get_immediate_width_bits(&xedd) != 0) {
+                stat_reason = STAT_MEM_OR_IMM_OPERAND;
+                goto end;
+            }
+            if (!form_ok || op_src == XED_REG_INVALID) {
+                stat_reason = STAT_FORM_ODD;
+                goto end;
+            }
+            // If the op's source is also its destination, that source holds
+            // the copied value, so the rewrite must read the copy's source:
+            //   movaps %a,%c; pxor %c,%c  ->  vpxor %a,%a,%c  (= a ^ a)
+            if (op_src == op_dst) {
+                op_src = copy_src;
+            }
+
+            xed_state_t state;
+            xed_state_zero(&state);
+            state.mmode = XED_MACHINE_MODE_LONG_64;
+            state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+            xed_encoder_instruction_t enc_inst;
+            xed_inst3(&enc_inst, state, vex_iclass, 128,
+                      xed_reg(op_dst), xed_reg(copy_src), xed_reg(op_src));
+            xed_encoder_request_t req;
+            xed_encoder_request_zero_set_mode(&req, &state);
+            if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+                stat_reason = STAT_ENCODE_FAIL;
+                goto end;
+            }
+            uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
+            unsigned int new_len = 0;
+            xed_error_enum_t enc_err = xed_encode(&req, new_bytes,
+                                                  sizeof(new_bytes), &new_len);
+            if (enc_err != XED_ERROR_NONE) {
+                stat_reason = STAT_ENCODE_FAIL;
+                goto end;
+            }
+
+            unsigned int old_len = (offset + xed_decoded_inst_get_length(&xedd)) -
+                                   copy_entry->offset;
+            if (new_len > old_len) {
+                stat_reason = STAT_TOO_LONG;
+                goto end;
+            }
+            size_t rewrite_end = offset + xed_decoded_inst_get_length(&xedd);
+            if (target_in_interior(branch_targets, copy_entry->offset,
+                                   rewrite_end)) {
+                stat_reason = STAT_BRANCH_TARGET_INTERIOR;
+                goto end;
+            }
+
+            printf("R %s %s, %s, %s [%u bytes, replacing %u]\n",
+                    xed_iclass_enum_t2str(vex_iclass),
+                    xed_reg_enum_t2str(op_dst), xed_reg_enum_t2str(copy_src),
+                    xed_reg_enum_t2str(op_src), new_len, old_len);
+            stat_reason = STAT_REWRITTEN;
+            ++count;
+
+            if (replace) {
+                uint8_t *addr = inst + copy_entry->offset;
+                memcpy(addr, new_bytes, new_len);
+                if (old_len > new_len) {
+                    enc_err = xed_encode_nop(addr + new_len, old_len - new_len);
+                    if (enc_err != XED_ERROR_NONE) {
+                        return -1;
+                    }
+                }
+            }
+        }
+
+end:
+        if (stat_reason >= 0) {
+            stat_record(iclass, stat_reason);
         }
         if (is_basic_block_terminator(&xedd)) {
             history_reset(&history);
