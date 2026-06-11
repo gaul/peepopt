@@ -34,7 +34,7 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "peepopt optimizes x86-64 binaries, rewriting them in-place\n" \
-            "usage: %s [--dry-run] [--verbose] <ELF_FILE>\n", program);
+            "usage: %s [--dry-run] [--stats] [--verbose] <ELF_FILE>\n", program);
     exit(EXIT_FAILURE);
 }
 
@@ -43,9 +43,11 @@ int main(int argc, char **argv)
     uint32_t idx;
     int rewrites = 0;
     bool dry_run = false;
+    bool stats = false;
     bool verbose = false;
     static const struct option long_opts[] = {
         { "dry-run", no_argument,       0, 'd' },
+        { "stats",   no_argument,       0, 's' },
         { "verbose", no_argument,       0, 'v' },
         { NULL,      0,                 0,  0  }
     };
@@ -55,6 +57,9 @@ int main(int argc, char **argv)
         switch (opt) {
         case 'd':
             dry_run = true;
+            break;
+        case 's':
+            stats = true;
             break;
         case 'v':
             verbose = true;
@@ -194,6 +199,9 @@ int main(int argc, char **argv)
         rewrites += andn_rewrites;
     }
 
+    if (stats) {
+        peepopt_print_stats();
+    }
     printf("%d rewrites\n", rewrites);
 
     munmap(addr, file_size);

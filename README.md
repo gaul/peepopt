@@ -90,6 +90,8 @@ XED_PATH=/path/to/xed make all
   - Show which replacements peepopt would do
 * `peepopt [--verbose] program_file`
   - Optimize the input binary with replacement instructions
+* `peepopt --dry-run --stats program_file`
+  - Also print a histogram of why each candidate site was or was not rewritten
 
 ## Future directions
 

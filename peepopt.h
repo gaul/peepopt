@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 void peepopt_set_verbose(bool verbose);
+void peepopt_print_stats(void);
 int check_shifts(uint8_t *inst, size_t len, bool replace);
 int check_andn(uint8_t *inst, size_t len, bool replace);
 

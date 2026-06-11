@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -31,6 +32,155 @@ void peepopt_set_verbose(bool verbose)
 }
 
 #define VLOG(...) do { if (g_verbose) printf(__VA_ARGS__); } while (0)
+
+// --stats support: histogram of why each candidate site was or was not
+// rewritten, keyed by (anchor iclass, reason). A shift candidate is any
+// SHL/SHR/SAR whose count register is CL; an ANDN candidate is any AND
+// immediately preceded by a reg-form NOT. Each candidate is charged to
+// exactly one reason: the first check that rejected it, or "rewritten".
+//
+// Reasons name the lifecycle stages every equal-size in-place rewrite shares
+// (candidate form, absorbed-writer validation, forward liveness, encode/fit)
+// and are deliberately rule-neutral, so a new rewrite rule reuses this
+// vocabulary instead of adding a per-rule enum. Counter rows appear lazily
+// per anchor iclass. If two future rules anchor on the same iclass they will
+// share a row and double-count candidates; add a per-rule dimension then.
+enum stat_reason {
+    STAT_REWRITTEN,
+    STAT_MEM_OR_IMM_OPERAND,
+    STAT_FORM_ODD,
+    STAT_NO_DEF_IN_WINDOW,
+    STAT_DEF_READ_BEFORE,
+    STAT_DEF_NOT_MOV,
+    STAT_DEF_NOT_REG_TO_REG,
+    STAT_DEF_DST_PARTIAL,
+    STAT_DEF_REG_UNRELATED,
+    STAT_UNIMPLEMENTED_VARIANT,
+    STAT_SRC_NOT_GPR,
+    STAT_SRC_HIGH_BYTE,
+    STAT_SRC_DST_SAME,
+    STAT_WIDTH_NOT_32_64,
+    STAT_WIDTH_MISMATCH,
+    STAT_GAP_NOT_ABSORBABLE,
+    STAT_LOOKAHEAD_BRANCH,
+    STAT_REG_READ_AFTER,
+    STAT_FLAGS_READ_AFTER,
+    STAT_REG_NOT_PROVEN_DEAD,
+    STAT_FLAGS_NOT_PROVEN_DEAD,
+    STAT_ENCODE_FAIL,
+    STAT_TOO_LONG,
+    STAT_BRANCH_TARGET_INTERIOR,
+    STAT_COUNT
+};
+
+static const char *const stat_names[STAT_COUNT] = {
+    [STAT_REWRITTEN]               = "rewritten",
+    [STAT_MEM_OR_IMM_OPERAND]      = "memory operand or immediate",
+    [STAT_FORM_ODD]                = "unexpected operand form",
+    [STAT_NO_DEF_IN_WINDOW]        = "no writer of needed register in window",
+    [STAT_DEF_READ_BEFORE]         = "needed register read before candidate",
+    [STAT_DEF_NOT_MOV]             = "writer is not a MOV",
+    [STAT_DEF_NOT_REG_TO_REG]      = "writer is not register-to-register",
+    [STAT_DEF_DST_PARTIAL]         = "writer destination is a sub-register",
+    [STAT_DEF_REG_UNRELATED]       = "writer register unrelated to candidate",
+    [STAT_UNIMPLEMENTED_VARIANT]   = "unimplemented pattern variant",
+    [STAT_SRC_NOT_GPR]             = "source is not a GPR",
+    [STAT_SRC_HIGH_BYTE]           = "source is AH/BH/CH/DH",
+    [STAT_SRC_DST_SAME]            = "source and destination are the same",
+    [STAT_WIDTH_NOT_32_64]         = "operand width not 32/64-bit",
+    [STAT_WIDTH_MISMATCH]          = "operand widths differ",
+    [STAT_GAP_NOT_ABSORBABLE]      = "gap to writer not absorbable",
+    [STAT_LOOKAHEAD_BRANCH]        = "branch during forward lookahead",
+    [STAT_REG_READ_AFTER]          = "stale register read after rewrite point",
+    [STAT_FLAGS_READ_AFTER]        = "stale flag read after rewrite point",
+    [STAT_REG_NOT_PROVEN_DEAD]     = "register death not proven in window",
+    [STAT_FLAGS_NOT_PROVEN_DEAD]   = "flag death not proven in window",
+    [STAT_ENCODE_FAIL]             = "encoder failure",
+    [STAT_TOO_LONG]                = "replacement longer than original",
+    [STAT_BRANCH_TARGET_INTERIOR]  = "branch target inside rewrite range",
+};
+
+// Far above the number of distinct anchor iclasses any plausible rule set
+// uses; rows past the cap are silently dropped.
+#define STAT_MAX_ROWS 32
+
+struct stat_row {
+    xed_iclass_enum_t iclass;
+    uint64_t candidates;
+    uint64_t counts[STAT_COUNT];
+};
+
+static struct stat_row stat_rows[STAT_MAX_ROWS];
+static size_t stat_row_count;
+
+static struct stat_row *stat_row_for(xed_iclass_enum_t iclass)
+{
+    for (size_t i = 0; i < stat_row_count; i++) {
+        if (stat_rows[i].iclass == iclass) {
+            return &stat_rows[i];
+        }
+    }
+    if (stat_row_count == STAT_MAX_ROWS) {
+        return NULL;
+    }
+    struct stat_row *row = &stat_rows[stat_row_count++];
+    row->iclass = iclass;
+    return row;
+}
+
+static void stat_candidate(xed_iclass_enum_t iclass)
+{
+    struct stat_row *row = stat_row_for(iclass);
+    if (row != NULL) {
+        row->candidates++;
+    }
+}
+
+static void stat_record(xed_iclass_enum_t iclass, enum stat_reason reason)
+{
+    struct stat_row *row = stat_row_for(iclass);
+    if (row != NULL) {
+        row->counts[reason]++;
+    }
+}
+
+void peepopt_print_stats(void)
+{
+    // Sort rows by iclass so output order does not depend on which candidate
+    // appeared first in the input.
+    const struct stat_row *rows[STAT_MAX_ROWS];
+    for (size_t i = 0; i < stat_row_count; i++) {
+        rows[i] = &stat_rows[i];
+    }
+    for (size_t i = 1; i < stat_row_count; i++) {
+        const struct stat_row *key = rows[i];
+        size_t j = i;
+        for (; j > 0 && rows[j - 1]->iclass > key->iclass; j--) {
+            rows[j] = rows[j - 1];
+        }
+        rows[j] = key;
+    }
+    for (size_t i = 0; i < stat_row_count; i++) {
+        const struct stat_row *row = rows[i];
+        printf("%s candidates: %" PRIu64 "\n",
+               xed_iclass_enum_t2str(row->iclass), row->candidates);
+        uint64_t accounted = 0;
+        for (size_t r = 0; r < STAT_COUNT; r++) {
+            accounted += row->counts[r];
+            if (row->counts[r] == 0 && r != STAT_REWRITTEN) {
+                continue;
+            }
+            double pct = row->candidates == 0 ? 0.0 :
+                    100.0 * (double)row->counts[r] / (double)row->candidates;
+            printf("  %-40s %8" PRIu64 " (%5.1f%%)\n",
+                   stat_names[r], row->counts[r], pct);
+        }
+        if (accounted != row->candidates) {
+            printf("  %-40s %8" PRId64 "\n", "unaccounted",
+                   (int64_t)(row->candidates - accounted));
+        }
+    }
+}
 
 #define HISTORY_SIZE 8
 
@@ -121,11 +271,35 @@ static void inst_touches_rcx(const xed_decoded_inst_t *xedd, bool *writes, bool 
     }
 }
 
+// A shift is a SHLX/SHRX/SARX candidate only when its count comes from CL
+// (the D2/D3 opcode group); immediate and shift-by-one forms have no MOV+CL
+// setup to absorb.
+static bool shift_count_is_cl(const xed_decoded_inst_t *xedd)
+{
+    const xed_inst_t *xi = xed_decoded_inst_inst(xedd);
+    unsigned int n = xed_inst_noperands(xi);
+    for (unsigned int i = 0; i < n; i++) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        xed_operand_enum_t op_name = xed_operand_name(op);
+        if (!xed_operand_is_register(op_name)) {
+            continue;
+        }
+        if (xed_decoded_inst_get_reg(xedd, op_name) == XED_REG_CL &&
+            action_reads(xed_operand_rw(op))) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Scan history backward (most-recent first) for the nearest instruction that writes RCX/ECX.
 // Returns NULL if an intervening instruction reads RCX without writing it (which would break
-// the def-use chain from the writer to the shift's CL read), or if no writer is in the window.
-static const struct inst_history_entry *history_find_rcx_def(const struct inst_history *h)
+// the def-use chain from the writer to the shift's CL read), setting *blocked_by_read, or if
+// no writer is in the window.
+static const struct inst_history_entry *history_find_rcx_def(const struct inst_history *h,
+                                                             bool *blocked_by_read)
 {
+    *blocked_by_read = false;
     for (size_t dist = 1; dist <= h->count; dist++) {
         const struct inst_history_entry *e = history_at(h, dist);
         bool w = false, r = false;
@@ -134,6 +308,7 @@ static const struct inst_history_entry *history_find_rcx_def(const struct inst_h
             return e;
         }
         if (r) {
+            *blocked_by_read = true;
             return NULL;
         }
     }
@@ -425,6 +600,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
     history_reset(&history);
 
     for (size_t offset = 0; offset < len;) {
+        int stat_reason = -1;
         xed_decoded_inst_t xedd;
         xed_decoded_inst_zero(&xedd);
         xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
@@ -444,15 +620,26 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             VLOG("* %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd));
         }
 
+        int iclass = xed_decoded_inst_get_iclass(&xedd);
+        bool is_shift = iclass == XED_ICLASS_SHL || iclass == XED_ICLASS_SHR ||
+                        iclass == XED_ICLASS_SAR;
+        bool is_cl_shift = is_shift && shift_count_is_cl(&xedd);
+        if (is_cl_shift) {
+            stat_candidate(iclass);
+        }
+
         // TODO: check XED_IFORM_SHL_GPR32_CL instead of number of memory operands?
         // TODO: SHLX supports a memory operand for one of the sources
         if (xed_decoded_inst_number_of_memory_operands(&xedd) != 0 ||
             xed_decoded_inst_get_immediate_width_bits(&xedd) != 0) {
+            if (is_cl_shift) {
+                // CL-count shifts have no immediate, so this is a memory dst.
+                stat_reason = STAT_MEM_OR_IMM_OPERAND;
+            }
             goto end;
         }
 
-        int iclass = xed_decoded_inst_get_iclass(&xedd);
-        if (iclass == XED_ICLASS_SHL || iclass == XED_ICLASS_SHR || iclass == XED_ICLASS_SAR) {
+        if (is_shift) {
             // Analyze shifts to see if it is possible to rewrite with three-operand BMI equivalent:
             // 1. previous instruction is a register-register MOV
             // 2. current instruction is a shift
@@ -473,8 +660,12 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             //     or %r8d, %edi
             //     shr %cl, %eax
             //     xor %ecx, %ecx
-            const struct inst_history_entry *mov_entry = history_find_rcx_def(&history);
+            bool rcx_blocked_by_read = false;
+            const struct inst_history_entry *mov_entry =
+                    history_find_rcx_def(&history, &rcx_blocked_by_read);
             if (mov_entry == NULL) {
+                stat_reason = rcx_blocked_by_read ?
+                        STAT_DEF_READ_BEFORE : STAT_NO_DEF_IN_WINDOW;
                 goto end;
             }
             const xed_decoded_inst_t *xedd_old = &mov_entry->xedd;
@@ -489,6 +680,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 oldiclass != XED_ICLASS_MOVZX &&
                 oldiclass != XED_ICLASS_MOVSX &&
                 oldiclass != XED_ICLASS_MOVSXD) {
+                stat_reason = STAT_DEF_NOT_MOV;
                 goto end;
             }
             // MOV1's offset vs. the shift determines the rewrite layout:
@@ -514,8 +706,10 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             for (unsigned int i = 0; i < noperands; i++) {
                 const xed_operand_t *op = xed_inst_operand(xi, i);
                 xed_operand_enum_t op_name = xed_operand_name(op);
-                if (!xed_operand_is_register(op_name))
+                if (!xed_operand_is_register(op_name)) {
+                    stat_reason = STAT_DEF_NOT_REG_TO_REG;
                     goto end;
+                }
 
                 xed_operand_action_enum_t action = xed_operand_rw(op);
                 xed_reg_enum_t reg = xed_decoded_inst_get_reg(xedd_old, xed_operand_name(op));
@@ -526,6 +720,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 } else if (action == XED_OPERAND_ACTION_W) {
                     mov_dst = reg;
                 } else {
+                    stat_reason = STAT_DEF_NOT_REG_TO_REG;
                     goto end;
                 }
             }
@@ -536,8 +731,10 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             for (unsigned int i = 0; i < noperands; i++) {
                 const xed_operand_t *op = xed_inst_operand(xi, i);
                 xed_operand_enum_t op_name = xed_operand_name(op);
-                if (!xed_operand_is_register(op_name))
+                if (!xed_operand_is_register(op_name)) {
+                    stat_reason = STAT_FORM_ODD;
                     goto end;
+                }
 
                 xed_operand_action_enum_t action = xed_operand_rw(op);
                 xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd, xed_operand_name(op));
@@ -548,12 +745,14 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 } else if (action == XED_OPERAND_ACTION_RW || action == XED_OPERAND_ACTION_W) {
                     if (xed_get_register_width_bits(reg) < 32) {
                         VLOG("Ignore partial registers\n");
+                        stat_reason = STAT_WIDTH_NOT_32_64;
                         goto end;
                     }
                     shift_dst = reg;
                 } else if (action == XED_OPERAND_ACTION_CW) {
                     // ignore FLAGS
                 } else {
+                    stat_reason = STAT_FORM_ODD;
                     goto end;
                 }
             }
@@ -564,6 +763,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             // TODO: check that the source and dest operands and widths match
             if (!((mov_dst == XED_REG_ECX || mov_dst == XED_REG_RCX) && shift_src == XED_REG_CL)) {
                 VLOG("Wrong register pairs for replacement\n");
+                stat_reason = STAT_DEF_DST_PARTIAL;
                 goto end;
             }
 
@@ -579,6 +779,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             // instead of relying on the encoder to reject the result.
             if (xed_reg_class(mov_src) != XED_REG_CLASS_GPR) {
                 VLOG("MOV1 source is not a general-purpose register; cannot use in SHLX\n");
+                stat_reason = STAT_SRC_NOT_GPR;
                 goto end;
             }
             // High-byte registers (AH/BH/CH/DH) are the exception: their bits
@@ -587,6 +788,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             if (mov_src == XED_REG_AH || mov_src == XED_REG_BH ||
                 mov_src == XED_REG_CH || mov_src == XED_REG_DH) {
                 VLOG("MOV1 source is a high-byte register; cannot use in SHLX\n");
+                stat_reason = STAT_SRC_HIGH_BYTE;
                 goto end;
             }
             unsigned int shift_width = xed_get_register_width_bits(shift_dst);
@@ -594,6 +796,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
             if (mov_src_width != shift_width) {
                 xed_reg_enum_t parent64 = xed_get_largest_enclosing_register(mov_src);
                 if (parent64 == XED_REG_INVALID) {
+                    stat_reason = STAT_SRC_NOT_GPR;
                     goto end;
                 }
                 if (shift_width == 64) {
@@ -714,6 +917,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 VLOG("MOV1 at offset %zu is %zu bytes before shift and gap is not an absorbable MOV2; skipping\n",
                         mov_entry->offset,
                         offset - mov_entry->offset - mov1_len_for_gap);
+                stat_reason = STAT_GAP_NOT_ABSORBABLE;
                 goto end;
             }
 
@@ -748,15 +952,18 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
 
                 if (is_branch_bailout(&xedd_new)) {
                     VLOG("Branch, cannot replace\n");
+                    stat_reason = STAT_LOOKAHEAD_BRANCH;
                     goto end;
                 }
                 if (!ecx_written && reads_ecx(&xedd_new)) {
                     VLOG("Reading from ECX, cannot replace\n");
+                    stat_reason = STAT_REG_READ_AFTER;
                     goto end;
                 }
                 uint32_t read_mask = read_rflags_mask(&xedd_new);
                 if ((read_mask & shift_flags_mask & ~killed_flags_mask) != 0) {
                     VLOG("Reading a shift-written EFLAGS bit, cannot replace\n");
+                    stat_reason = STAT_FLAGS_READ_AFTER;
                     goto end;
                 }
                 if (kills_ecx(&xedd_new)) {
@@ -827,6 +1034,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 xed_encoder_request_zero_set_mode(&req, &state);
                 if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
                     fprintf(stderr, "Could not convert SHLX request\n");
+                    stat_reason = STAT_ENCODE_FAIL;
                     goto end;
                 }
                 xed_error_enum_t err = xed_encode(&req, new_bytes, sizeof(new_bytes), &new_len);
@@ -835,6 +1043,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                     char buf[1024];
                     xed_encode_request_print(&req, buf, sizeof(buf));
                     fprintf(stderr, "%s\n", buf);
+                    stat_reason = STAT_ENCODE_FAIL;
                     goto end;
                 }
 
@@ -842,12 +1051,14 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 VLOG("Replacement instruction is %u bytes and original instructions are %u bytes\n", new_len, old_len);
                 if (new_len > old_len) {
                     VLOG("Cannot replace instructions since replacement is too large\n");
+                    stat_reason = STAT_TOO_LONG;
                     goto end;
                 }
                 if (target_in_interior(branch_targets, rewrite_offset,
                                        offset + xed_decoded_inst_get_length(&xedd))) {
                     VLOG("Branch target inside rewrite range [%zu, %zu); skipping\n",
                             rewrite_offset, offset + xed_decoded_inst_get_length(&xedd));
+                    stat_reason = STAT_BRANCH_TARGET_INTERIOR;
                     goto end;
                 }
 
@@ -866,6 +1077,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 if (ok) {
                     printf("R %s [%u bytes]\n", buffer, xed_decoded_inst_get_length(&xedd_tmp));
                 }
+                stat_reason = STAT_REWRITTEN;
                 ++count;
 
                 // TODO: consider that shift distance may be > 31 for ECX or > 63 for RCX
@@ -884,10 +1096,15 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                 }
             } else {
                 VLOG("Replacement not possible ecx_written: %d eflags_written: %d\n", ecx_written, eflags_written);
+                stat_reason = !ecx_written ? STAT_REG_NOT_PROVEN_DEAD :
+                        STAT_FLAGS_NOT_PROVEN_DEAD;
             }
         }
 
 end:
+        if (stat_reason >= 0) {
+            stat_record(iclass, stat_reason);
+        }
         if (is_basic_block_terminator(&xedd)) {
             history_reset(&history);
         } else {
@@ -915,6 +1132,36 @@ int check_andn(uint8_t *inst, size_t len, bool replace)
     return result;
 }
 
+// Probe for a reg-form NOT immediately preceding the instruction at `offset`
+// (the ANDN candidate shape). Returns the history entry and sets *not_reg, or
+// returns NULL.
+static const struct inst_history_entry *find_adjacent_not(
+        const struct inst_history *h, size_t offset, xed_reg_enum_t *not_reg)
+{
+    *not_reg = XED_REG_INVALID;
+    const struct inst_history_entry *e = history_at(h, 1);
+    if (e == NULL ||
+        xed_decoded_inst_get_iclass(&e->xedd) != XED_ICLASS_NOT ||
+        xed_decoded_inst_number_of_memory_operands(&e->xedd) != 0 ||
+        e->offset + xed_decoded_inst_get_length(&e->xedd) != offset) {
+        return NULL;
+    }
+    const xed_inst_t *xi_not = xed_decoded_inst_inst(&e->xedd);
+    if (xed_inst_noperands(xi_not) < 1) {
+        return NULL;
+    }
+    const xed_operand_t *op = xed_inst_operand(xi_not, 0);
+    if (!xed_operand_is_register(xed_operand_name(op)) ||
+        xed_operand_rw(op) != XED_OPERAND_ACTION_RW) {
+        return NULL;
+    }
+    *not_reg = xed_decoded_inst_get_reg(&e->xedd, xed_operand_name(op));
+    if (*not_reg == XED_REG_INVALID) {
+        return NULL;
+    }
+    return e;
+}
+
 // Rewrite `not %reg_A; and %reg_A, %reg_B` as `andn %reg_A, %reg_B, %reg_B`.
 // ANDN reads the un-negated value of reg_A directly, so after the rewrite
 // reg_A holds its original value rather than the inverted one; we refuse
@@ -934,6 +1181,7 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
     const uint32_t pf_bit = 1u << 2;
 
     for (size_t offset = 0; offset < len;) {
+        int stat_reason = -1;
         xed_decoded_inst_t xedd;
         xed_decoded_inst_zero(&xedd);
         xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
@@ -948,8 +1196,20 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         if (xed_decoded_inst_get_iclass(&xedd) != XED_ICLASS_AND) {
             goto end;
         }
+        // Probe for the adjacent NOT before the form checks so that every
+        // NOT+AND pair is counted as a candidate for --stats, even when the
+        // AND itself is unusable.
+        xed_reg_enum_t not_reg = XED_REG_INVALID;
+        const struct inst_history_entry *not_entry =
+                find_adjacent_not(&history, offset, &not_reg);
+        if (not_entry != NULL) {
+            stat_candidate(XED_ICLASS_AND);
+        }
         if (xed_decoded_inst_number_of_memory_operands(&xedd) != 0 ||
             xed_decoded_inst_get_immediate_width_bits(&xedd) != 0) {
+            if (not_entry != NULL) {
+                stat_reason = STAT_MEM_OR_IMM_OPERAND;
+            }
             goto end;
         }
 
@@ -982,35 +1242,14 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
             }
         }
         if (!form_ok || and_dst == XED_REG_INVALID || and_src == XED_REG_INVALID) {
-            goto end;
-        }
-
-        // Find an adjacent preceding NOT on one of AND's source operands.
-        const struct inst_history_entry *not_entry = history_at(&history, 1);
-        if (not_entry == NULL) {
-            goto end;
-        }
-        if (xed_decoded_inst_get_iclass(&not_entry->xedd) != XED_ICLASS_NOT) {
-            goto end;
-        }
-        if (xed_decoded_inst_number_of_memory_operands(&not_entry->xedd) != 0) {
-            goto end;
-        }
-        if (not_entry->offset + xed_decoded_inst_get_length(&not_entry->xedd) != offset) {
-            goto end;
-        }
-
-        const xed_inst_t *xi_not = xed_decoded_inst_inst(&not_entry->xedd);
-        xed_reg_enum_t not_reg = XED_REG_INVALID;
-        if (xed_inst_noperands(xi_not) >= 1) {
-            const xed_operand_t *op = xed_inst_operand(xi_not, 0);
-            if (xed_operand_is_register(xed_operand_name(op)) &&
-                xed_operand_rw(op) == XED_OPERAND_ACTION_RW) {
-                not_reg = xed_decoded_inst_get_reg(&not_entry->xedd,
-                                                    xed_operand_name(op));
+            if (not_entry != NULL) {
+                stat_reason = STAT_FORM_ODD;
             }
+            goto end;
         }
-        if (not_reg == XED_REG_INVALID) {
+
+        // The adjacent preceding NOT was probed above.
+        if (not_entry == NULL) {
             goto end;
         }
 
@@ -1019,6 +1258,9 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         // less clean to encode (REG0 and REG1 would share a register).
         if (xed_get_largest_enclosing_register(not_reg) !=
             xed_get_largest_enclosing_register(and_src)) {
+            stat_reason = xed_get_largest_enclosing_register(not_reg) ==
+                          xed_get_largest_enclosing_register(and_dst) ?
+                    STAT_UNIMPLEMENTED_VARIANT : STAT_DEF_REG_UNRELATED;
             goto end;
         }
         xed_reg_enum_t mask_reg = and_src;
@@ -1030,11 +1272,13 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         // ZF forced to 1), whereas `not %reg; and %reg,%reg` leaves reg = ~reg.
         if (xed_get_largest_enclosing_register(mask_reg) ==
             xed_get_largest_enclosing_register(other_reg)) {
+            stat_reason = STAT_SRC_DST_SAME;
             goto end;
         }
 
         unsigned int eow = xed_get_register_width_bits(and_dst);
         if (eow != 32 && eow != 64) {
+            stat_reason = STAT_WIDTH_NOT_32_64;
             goto end;
         }
 
@@ -1045,6 +1289,7 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         // those high bits set. (enclosing-register equality above is not
         // enough -- it treats EAX and RAX as the same operand.)
         if (xed_get_register_width_bits(not_reg) != eow) {
+            stat_reason = STAT_WIDTH_MISMATCH;
             goto end;
         }
 
@@ -1062,16 +1307,19 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
                 return -1;
             }
             if (is_branch_bailout(&xedd_new)) {
+                stat_reason = STAT_LOOKAHEAD_BRANCH;
                 goto end;
             }
             bool w = false, r = false;
             inst_touches_reg(&xedd_new, mask_reg, &w, &r);
             bool zeroing = is_zeroing_idiom_on(&xedd_new, mask_reg);
             if (r && !zeroing && !mask_killed) {
+                stat_reason = STAT_REG_READ_AFTER;
                 goto end;
             }
             uint32_t read_mask = read_rflags_mask(&xedd_new);
             if ((read_mask & pf_bit & ~killed_flags) != 0) {
+                stat_reason = STAT_FLAGS_READ_AFTER;
                 goto end;
             }
             if (kills_reg_full(&xedd_new, mask_reg)) {
@@ -1084,6 +1332,8 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
             new_offset += xed_decoded_inst_get_length(&xedd_new);
         }
         if (!mask_killed || (pf_bit & ~killed_flags) != 0) {
+            stat_reason = !mask_killed ? STAT_REG_NOT_PROVEN_DEAD :
+                    STAT_FLAGS_NOT_PROVEN_DEAD;
             goto end;
         }
 
@@ -1098,6 +1348,7 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         xed_encoder_request_t req;
         xed_encoder_request_zero_set_mode(&req, &state);
         if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+            stat_reason = STAT_ENCODE_FAIL;
             goto end;
         }
         uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
@@ -1105,22 +1356,26 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         xed_error_enum_t enc_err = xed_encode(&req, new_bytes, sizeof(new_bytes),
                                                &new_len);
         if (enc_err != XED_ERROR_NONE) {
+            stat_reason = STAT_ENCODE_FAIL;
             goto end;
         }
 
         unsigned int old_len = (offset + xed_decoded_inst_get_length(&xedd)) -
                                not_entry->offset;
         if (new_len > old_len) {
+            stat_reason = STAT_TOO_LONG;
             goto end;
         }
         size_t rewrite_end = offset + xed_decoded_inst_get_length(&xedd);
         if (target_in_interior(branch_targets, not_entry->offset, rewrite_end)) {
+            stat_reason = STAT_BRANCH_TARGET_INTERIOR;
             goto end;
         }
 
         printf("R andn %s, %s, %s [%u bytes, replacing %u]\n",
                 xed_reg_enum_t2str(and_dst), xed_reg_enum_t2str(mask_reg),
                 xed_reg_enum_t2str(other_reg), new_len, old_len);
+        stat_reason = STAT_REWRITTEN;
         ++count;
 
         if (replace) {
@@ -1135,6 +1390,9 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         }
 
 end:
+        if (stat_reason >= 0) {
+            stat_record(XED_ICLASS_AND, stat_reason);
+        }
         if (is_basic_block_terminator(&xedd)) {
             history_reset(&history);
         } else {
