@@ -1678,6 +1678,30 @@ static const struct inst_history_entry *find_adjacent_xmm_copy(
     return e;
 }
 
+// Encode `vex_iclass %rm, %src1, %dst` (Intel operand order dst, src1, rm)
+// into out, returning the XED error. Shared by the register path and the
+// two-pass RIP-relative memory path, which must encode once to learn the
+// instruction length before the final displacement is known.
+static xed_error_enum_t vex3_encode(xed_iclass_enum_t vex_iclass,
+                                    xed_reg_enum_t dst, xed_reg_enum_t src1,
+                                    xed_encoder_operand_t rm,
+                                    uint8_t *out, unsigned int *out_len)
+{
+    xed_state_t state;
+    xed_state_zero(&state);
+    state.mmode = XED_MACHINE_MODE_LONG_64;
+    state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    xed_encoder_instruction_t enc_inst;
+    xed_inst3(&enc_inst, state, vex_iclass, 128,
+              xed_reg(dst), xed_reg(src1), rm);
+    xed_encoder_request_t req;
+    xed_encoder_request_zero_set_mode(&req, &state);
+    if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+        return XED_ERROR_GENERAL_ERROR;
+    }
+    return xed_encode(&req, out, XED_MAX_INSTRUCTION_BYTES, out_len);
+}
+
 static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
                             const uint8_t *branch_targets);
 
@@ -1707,12 +1731,23 @@ int check_vex3(uint8_t *inst, size_t len, bool replace)
 // (vaddss fills the upper lanes from its first source exactly as the movaps
 // did).
 //
-// The only architectural difference is that VEX-encoded ops zero the
-// destination's YMM/ZMM bits above 127 where legacy SSE preserves them.
-// SSE-only code cannot read those bits and the SysV ABI makes every vector
-// register call-clobbered, so no conforming code can observe the change.
-// VEX.128 writes also leave the AVX upper state clean, avoiding SSE/AVX
-// transition penalties.
+// A memory source folds into the VEX r/m slot the same way:
+//
+//   movaps %a,%c; op (mem),%c   ->   vop (mem),%a,%c
+//
+// The copy is reg-to-reg, so the load reads the same address and value at
+// its new position; RIP-relative displacements are recomputed for the new
+// location.
+//
+// Two architectural differences, neither observable by conforming code:
+//  * VEX-encoded ops zero the destination's YMM/ZMM bits above 127 where
+//    legacy SSE preserves them. SSE-only code cannot read those bits and
+//    the SysV ABI makes every vector register call-clobbered. VEX.128
+//    writes also leave the AVX upper state clean, avoiding SSE/AVX
+//    transition penalties.
+//  * Legacy packed ops #GP on a misaligned 16-byte memory operand while
+//    their VEX forms allow unaligned access, so an execution that would
+//    have faulted now computes normally.
 static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
                             const uint8_t *branch_targets)
 {
@@ -1754,7 +1789,7 @@ static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
             const xed_operand_t *op = xed_inst_operand(xi, i);
             xed_operand_enum_t op_name = xed_operand_name(op);
             if (!xed_operand_is_register(op_name)) {
-                continue;  // memory operand pieces; the nmem check rejects
+                continue;  // memory operand pieces; handled via xed_mem_gbisd
             }
             xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd, op_name);
             if (reg == XED_REG_MXCSR) {
@@ -1788,42 +1823,91 @@ static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
                 goto end;
             }
             stat_candidate(iclass);
-            if (xed_decoded_inst_number_of_memory_operands(&xedd) != 0 ||
-                xed_decoded_inst_get_immediate_width_bits(&xedd) != 0) {
+            unsigned int nmem = xed_decoded_inst_number_of_memory_operands(&xedd);
+            if (xed_decoded_inst_get_immediate_width_bits(&xedd) != 0 ||
+                nmem > 1 ||
+                (nmem == 1 && (!xed_decoded_inst_mem_read(&xedd, 0) ||
+                               xed_decoded_inst_mem_written(&xedd, 0)))) {
                 stat_reason = STAT_MEM_OR_IMM_OPERAND;
                 goto end;
             }
-            if (!form_ok || op_src == XED_REG_INVALID) {
+            if (!form_ok || (nmem == 0 && op_src == XED_REG_INVALID)) {
                 stat_reason = STAT_FORM_ODD;
                 goto end;
             }
-            // If the op's source is also its destination, that source holds
-            // the copied value, so the rewrite must read the copy's source:
-            //   movaps %a,%c; pxor %c,%c  ->  vpxor %a,%a,%c  (= a ^ a)
-            if (op_src == op_dst) {
-                op_src = copy_src;
+
+            xed_encoder_operand_t op_rm;
+            bool rip_mem = false;
+            int64_t rip_target = 0;
+            if (nmem == 1) {
+                xed_reg_enum_t mem_base = xed_decoded_inst_get_base_reg(&xedd, 0);
+                if (mem_base == XED_REG_EIP) {
+                    stat_reason = STAT_FORM_ODD;
+                    goto end;
+                }
+                int64_t disp = xed_decoded_inst_get_memory_displacement(&xedd, 0);
+                xed_uint_t disp_width_bits =
+                        xed_decoded_inst_get_memory_displacement_width_bits(&xedd, 0);
+                if (mem_base == XED_REG_RIP) {
+                    // The displacement depends on the VEX instruction's
+                    // length, so encode with a placeholder first and patch
+                    // in a second pass below.
+                    rip_mem = true;
+                    rip_target = (int64_t)offset +
+                                 (int64_t)xed_decoded_inst_get_length(&xedd) +
+                                 disp;
+                    disp = 0;
+                    disp_width_bits = 32;
+                }
+                op_rm = xed_mem_gbisd(
+                        xed_decoded_inst_get_seg_reg(&xedd, 0),
+                        mem_base,
+                        xed_decoded_inst_get_index_reg(&xedd, 0),
+                        xed_decoded_inst_get_scale(&xedd, 0),
+                        xed_disp(disp, disp_width_bits),
+                        xed_decoded_inst_get_memory_operand_length(&xedd, 0) * 8);
+            } else {
+                // If the op's source is also its destination, that source
+                // holds the copied value, so the rewrite must read the
+                // copy's source:
+                //   movaps %a,%c; pxor %c,%c  ->  vpxor %a,%a,%c  (= a ^ a)
+                if (op_src == op_dst) {
+                    op_src = copy_src;
+                }
+                op_rm = xed_reg(op_src);
             }
 
-            xed_state_t state;
-            xed_state_zero(&state);
-            state.mmode = XED_MACHINE_MODE_LONG_64;
-            state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
-            xed_encoder_instruction_t enc_inst;
-            xed_inst3(&enc_inst, state, vex_iclass, 128,
-                      xed_reg(op_dst), xed_reg(copy_src), xed_reg(op_src));
-            xed_encoder_request_t req;
-            xed_encoder_request_zero_set_mode(&req, &state);
-            if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+            uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
+            unsigned int new_len = 0;
+            if (vex3_encode(vex_iclass, op_dst, copy_src, op_rm,
+                            new_bytes, &new_len) != XED_ERROR_NONE) {
                 stat_reason = STAT_ENCODE_FAIL;
                 goto end;
             }
-            uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
-            unsigned int new_len = 0;
-            xed_error_enum_t enc_err = xed_encode(&req, new_bytes,
-                                                  sizeof(new_bytes), &new_len);
-            if (enc_err != XED_ERROR_NONE) {
-                stat_reason = STAT_ENCODE_FAIL;
-                goto end;
+            if (rip_mem) {
+                // RIP forms always carry a disp32, so re-encoding with the
+                // real displacement cannot change the length; refuse if it
+                // somehow does.
+                int64_t disp = rip_target -
+                               (int64_t)(copy_entry->offset + new_len);
+                if (disp < INT32_MIN || disp > INT32_MAX) {
+                    stat_reason = STAT_ENCODE_FAIL;
+                    goto end;
+                }
+                op_rm = xed_mem_gbisd(
+                        xed_decoded_inst_get_seg_reg(&xedd, 0),
+                        XED_REG_RIP,
+                        xed_decoded_inst_get_index_reg(&xedd, 0),
+                        xed_decoded_inst_get_scale(&xedd, 0),
+                        xed_disp(disp, 32),
+                        xed_decoded_inst_get_memory_operand_length(&xedd, 0) * 8);
+                unsigned int len2 = 0;
+                if (vex3_encode(vex_iclass, op_dst, copy_src, op_rm,
+                                new_bytes, &len2) != XED_ERROR_NONE ||
+                    len2 != new_len) {
+                    stat_reason = STAT_ENCODE_FAIL;
+                    goto end;
+                }
             }
 
             unsigned int old_len = (offset + xed_decoded_inst_get_length(&xedd)) -
@@ -1842,7 +1926,8 @@ static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
             printf("R %s %s, %s, %s [%u bytes, replacing %u]\n",
                     xed_iclass_enum_t2str(vex_iclass),
                     xed_reg_enum_t2str(op_dst), xed_reg_enum_t2str(copy_src),
-                    xed_reg_enum_t2str(op_src), new_len, old_len);
+                    nmem == 1 ? "mem" : xed_reg_enum_t2str(op_src),
+                    new_len, old_len);
             stat_reason = STAT_REWRITTEN;
             ++count;
 
@@ -1850,8 +1935,8 @@ static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
                 uint8_t *addr = inst + copy_entry->offset;
                 memcpy(addr, new_bytes, new_len);
                 if (old_len > new_len) {
-                    enc_err = xed_encode_nop(addr + new_len, old_len - new_len);
-                    if (enc_err != XED_ERROR_NONE) {
+                    if (xed_encode_nop(addr + new_len,
+                                       old_len - new_len) != XED_ERROR_NONE) {
                         return -1;
                     }
                 }

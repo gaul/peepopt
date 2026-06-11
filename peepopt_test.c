@@ -1006,11 +1006,81 @@ int main(int argc, char *argv[])
         0xC3
     );
 
-    /* Memory-source ops are not yet folded. */
+    /* Memory-source ops fold into the VEX r/m slot. */
+    {
+        uint8_t bytes[] = {
+            0x0F, 0x28, 0xD1,        // movaps %xmm1,%xmm2
+            0xF3, 0x0F, 0x58, 0x17,  // addss (%rdi),%xmm2
+            0xC3,
+        };
+        uint8_t expect[] = {
+            0xC5, 0xF2, 0x58, 0x17,  // vaddss (%rdi),%xmm1,%xmm2
+            0x0F, 0x1F, 0x00,        // 3-byte NOP
+            0xC3,
+        };
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        if (got != 1) {
+            fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
+                    __FILE__, __LINE__, got);
+            ++failures;
+        } else if (memcmp(bytes, expect, sizeof(bytes)) != 0) {
+            fprintf(stderr, "%s:%d: vex3 buffer mismatch\n", __FILE__, __LINE__);
+            fprintf(stderr, "  got:     ");
+            for (size_t i = 0; i < sizeof(bytes); ++i) fprintf(stderr, "%02X ", bytes[i]);
+            fprintf(stderr, "\n  expect:  ");
+            for (size_t i = 0; i < sizeof(expect); ++i) fprintf(stderr, "%02X ", expect[i]);
+            fprintf(stderr, "\n");
+            ++failures;
+        }
+    }
+
+    /* RIP-relative memory source: the VEX instruction sits at the copy's
+       offset with a different length, so the displacement is recomputed.
+       Original target = 3 + 8 + 0x20 = 0x2B; VEX form is 8 bytes at offset
+       0, so the new displacement is 0x2B - 8 = 0x23. */
+    {
+        uint8_t bytes[] = {
+            0x0F, 0x28, 0xD1,                          // movaps %xmm1,%xmm2
+            0xF2, 0x0F, 0x58, 0x15,                    // addsd 0x20(%rip),%xmm2
+            0x20, 0x00, 0x00, 0x00,
+            0xC3,
+        };
+        uint8_t expect[] = {
+            0xC5, 0xF3, 0x58, 0x15,                    // vaddsd 0x23(%rip),%xmm1,%xmm2
+            0x23, 0x00, 0x00, 0x00,
+            0x0F, 0x1F, 0x00,                          // 3-byte NOP
+            0xC3,
+        };
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        if (got != 1) {
+            fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
+                    __FILE__, __LINE__, got);
+            ++failures;
+        } else if (memcmp(bytes, expect, sizeof(bytes)) != 0) {
+            fprintf(stderr, "%s:%d: vex3 buffer mismatch\n", __FILE__, __LINE__);
+            fprintf(stderr, "  got:     ");
+            for (size_t i = 0; i < sizeof(bytes); ++i) fprintf(stderr, "%02X ", bytes[i]);
+            fprintf(stderr, "\n  expect:  ");
+            for (size_t i = 0; i < sizeof(expect); ++i) fprintf(stderr, "%02X ", expect[i]);
+            fprintf(stderr, "\n");
+            ++failures;
+        }
+    }
+
+    /* Packed op with a base+disp memory source. */
+    CHECK_VEX3(
+        1,
+        0x0F, 0x28, 0xD1,              // movaps %xmm1,%xmm2
+        0x0F, 0x58, 0x50, 0x10,        // addps 0x10(%rax),%xmm2
+        0xC3
+    );
+
+    /* Immediate forms share an iclass with the xmm-count shifts but cannot
+       fold (no copy-source slot); they must stay refused. */
     CHECK_VEX3(
         0,
-        0x0F, 0x28, 0xD1,        // movaps %xmm1,%xmm2
-        0xF3, 0x0F, 0x58, 0x17,  // addss (%rdi),%xmm2
+        0x66, 0x0F, 0x6F, 0xD1,        // movdqa %xmm1,%xmm2
+        0x66, 0x0F, 0x71, 0xF2, 0x03,  // psllw $3,%xmm2
         0xC3
     );
 
