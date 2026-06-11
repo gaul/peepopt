@@ -45,9 +45,71 @@ C3             ret
 Note that this is not equivalent to the former example since `sall` explicitly writes to `%cl` and implicitly writes to `EFLAGS`.
 When rewriting instructions peepopt examines subsequent instructions to ensure that they would not observe the replacement.
 
+## Transformations
+
+peepopt currently implements three families of rewrites, all within the x86-64-v3 feature level (BMI1, BMI2, AVX).
+Every replacement fits within the bytes of the original instructions — shorter replacements are padded with no-ops — and is refused when a branch targets the interior of the rewritten range.
+
+### Variable shifts: SHL/SHR/SAR → SHLX/SHRX/SARX (BMI2)
+
+The legacy shifts take a variable count only in `%cl`, so compilers emit a `mov` to stage it:
+
+```
+4889F1         mov %rsi,%rcx
+48D3E0         shl %cl,%rax
+```
+
+The BMI2 shifts take the count from any register and do not write `EFLAGS`:
+
+```
+C4E2C9F7C0     shlx %rsi,%rax,%rax
+```
+
+After the rewrite `%rcx` no longer holds the count and `EFLAGS` no longer holds the shift's result flags, so peepopt scans forward to prove both are overwritten before any read.
+The pass can also absorb a second `mov` supplying the shifted value — producing the fully three-operand form shown in the example above — and when the count-setting `mov` is not adjacent to the shift it repacks the instructions between them downward so the pair becomes contiguous.
+
+### NOT + AND → ANDN (BMI1)
+
+An and-not computation `dst = ~a & b` requires two instructions:
+
+```
+48F7D7         not %rdi
+4821F7         and %rsi,%rdi
+```
+
+`andn` computes it in one:
+
+```
+C4E2C0F2FE     andn %rsi,%rdi,%rdi
+```
+
+Both orderings are handled.
+Inverting the AND destination (shown) leaves no register holding a stale value.
+Inverting the AND source (`not %rsi; and %rsi,%rdi` → `andn %rdi,%rsi,%rdi`) leaves `%rsi` holding its original rather than inverted value, so it is only rewritten when `%rsi` is overwritten before any later read.
+In both cases `andn` leaves `PF` undefined where `and` defines it, so `PF` must also be dead.
+
+### SSE copy + op → AVX three-operand VEX form
+
+Two-operand SSE instructions destroy their first source, so compilers copy values that are still needed:
+
+```
+660F28D0       movapd %xmm0,%xmm2
+660F58D1       addpd %xmm1,%xmm2
+```
+
+The VEX-encoded forms of the same operations take a separate destination, folding the copy away:
+
+```
+C5F958D1       vaddpd %xmm1,%xmm0,%xmm2
+```
+
+93 scalar and packed opcodes are mapped: floating-point arithmetic and min/max, logic, integer arithmetic with and without saturation, multiplies, averages, compares, packs and unpacks, and shifts.
+A memory source folds into the VEX form the same way (`movapd %xmm4,%xmm5; addsd 8(%rax),%xmm5` → `vaddsd 8(%rax),%xmm4,%xmm5`), recomputing RIP-relative displacements for the new instruction location.
+Unlike the integer rewrites this needs no forward analysis: neither instruction touches `EFLAGS` and every register holds the same value afterward.
+
 ## Optimizing existing binaries
 
-Currently peepopt only does simple replacements, e.g., shifts, that can be done without increasing or decreasing the number of instruction bytes.
+Currently peepopt only does the simple replacements described above that can be done without increasing or decreasing the number of instruction bytes.
 Unused bytes are padded with no-ops which may seem wasteful but processors discard them early during execution.
 Further the instructions represent fewer and simpler micro-operations which increase instruction cache hit rates and reduce execution overhead.
 
