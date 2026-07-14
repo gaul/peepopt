@@ -1,3 +1,7 @@
 peepopt
 peepopt_test
 *.o
+test-apx-fixture
+*.opt
+apx-*.out
+apx-*.log

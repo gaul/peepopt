@@ -34,7 +34,7 @@ void peepopt_set_verbose(bool verbose)
 #define VLOG(...) do { if (g_verbose) printf(__VA_ARGS__); } while (0)
 
 // --stats support: histogram of why each candidate site was or was not
-// rewritten, keyed by (anchor iclass, reason). A shift candidate is any
+// rewritten, keyed by (rule, anchor iclass, reason). A shift candidate is any
 // SHL/SHR/SAR whose count register is CL; an ANDN candidate is any AND
 // immediately preceded by a reg-form NOT. Each candidate is charged to
 // exactly one reason: the first check that rejected it, or "rewritten".
@@ -43,11 +43,13 @@ void peepopt_set_verbose(bool verbose)
 // (candidate form, absorbed-writer validation, forward liveness, encode/fit)
 // and are deliberately rule-neutral, so a new rewrite rule reuses this
 // vocabulary instead of adding a per-rule enum. Counter rows appear lazily
-// per anchor iclass. If two future rules anchor on the same iclass they will
-// share a row and double-count candidates; add a per-rule dimension then.
+// per (rule, anchor iclass); the rule dimension keeps counts separate when
+// two rules anchor on the same iclass (the ANDN and APX rules both anchor
+// AND).
 enum stat_reason {
     STAT_REWRITTEN,
     STAT_MEM_OR_IMM_OPERAND,
+    STAT_MEM_ADDR_USES_DST,
     STAT_FORM_ODD,
     STAT_NO_DEF_IN_WINDOW,
     STAT_DEF_READ_BEFORE,
@@ -76,6 +78,7 @@ enum stat_reason {
 static const char *const stat_names[STAT_COUNT] = {
     [STAT_REWRITTEN]               = "rewritten",
     [STAT_MEM_OR_IMM_OPERAND]      = "memory operand or immediate",
+    [STAT_MEM_ADDR_USES_DST]       = "memory address reads the copy destination",
     [STAT_FORM_ODD]                = "unexpected operand form",
     [STAT_NO_DEF_IN_WINDOW]        = "no writer of needed register in window",
     [STAT_DEF_READ_BEFORE]         = "needed register read before candidate",
@@ -106,6 +109,7 @@ static const char *const stat_names[STAT_COUNT] = {
 #define STAT_MAX_ROWS 192
 
 struct stat_row {
+    const char *rule;
     xed_iclass_enum_t iclass;
     uint64_t candidates;
     uint64_t counts[STAT_COUNT];
@@ -114,10 +118,12 @@ struct stat_row {
 static struct stat_row stat_rows[STAT_MAX_ROWS];
 static size_t stat_row_count;
 
-static struct stat_row *stat_row_for(xed_iclass_enum_t iclass)
+static struct stat_row *stat_row_for(const char *rule,
+                                     xed_iclass_enum_t iclass)
 {
     for (size_t i = 0; i < stat_row_count; i++) {
-        if (stat_rows[i].iclass == iclass) {
+        if (stat_rows[i].iclass == iclass &&
+            strcmp(stat_rows[i].rule, rule) == 0) {
             return &stat_rows[i];
         }
     }
@@ -125,21 +131,23 @@ static struct stat_row *stat_row_for(xed_iclass_enum_t iclass)
         return NULL;
     }
     struct stat_row *row = &stat_rows[stat_row_count++];
+    row->rule = rule;
     row->iclass = iclass;
     return row;
 }
 
-static void stat_candidate(xed_iclass_enum_t iclass)
+static void stat_candidate(const char *rule, xed_iclass_enum_t iclass)
 {
-    struct stat_row *row = stat_row_for(iclass);
+    struct stat_row *row = stat_row_for(rule, iclass);
     if (row != NULL) {
         row->candidates++;
     }
 }
 
-static void stat_record(xed_iclass_enum_t iclass, enum stat_reason reason)
+static void stat_record(const char *rule, xed_iclass_enum_t iclass,
+                        enum stat_reason reason)
 {
-    struct stat_row *row = stat_row_for(iclass);
+    struct stat_row *row = stat_row_for(rule, iclass);
     if (row != NULL) {
         row->counts[reason]++;
     }
@@ -147,8 +155,8 @@ static void stat_record(xed_iclass_enum_t iclass, enum stat_reason reason)
 
 void peepopt_print_stats(void)
 {
-    // Sort rows by iclass so output order does not depend on which candidate
-    // appeared first in the input.
+    // Sort rows by (rule, iclass) so output order does not depend on which
+    // candidate appeared first in the input.
     const struct stat_row *rows[STAT_MAX_ROWS];
     for (size_t i = 0; i < stat_row_count; i++) {
         rows[i] = &stat_rows[i];
@@ -156,14 +164,16 @@ void peepopt_print_stats(void)
     for (size_t i = 1; i < stat_row_count; i++) {
         const struct stat_row *key = rows[i];
         size_t j = i;
-        for (; j > 0 && rows[j - 1]->iclass > key->iclass; j--) {
+        for (; j > 0 && (strcmp(rows[j - 1]->rule, key->rule) > 0 ||
+                         (strcmp(rows[j - 1]->rule, key->rule) == 0 &&
+                          rows[j - 1]->iclass > key->iclass)); j--) {
             rows[j] = rows[j - 1];
         }
         rows[j] = key;
     }
     for (size_t i = 0; i < stat_row_count; i++) {
         const struct stat_row *row = rows[i];
-        printf("%s candidates: %" PRIu64 "\n",
+        printf("%s %s candidates: %" PRIu64 "\n", row->rule,
                xed_iclass_enum_t2str(row->iclass), row->candidates);
         uint64_t accounted = 0;
         for (size_t r = 0; r < STAT_COUNT; r++) {
@@ -748,7 +758,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                         iclass == XED_ICLASS_SAR;
         bool is_cl_shift = is_shift && shift_count_is_cl(&xedd);
         if (is_cl_shift) {
-            stat_candidate(iclass);
+            stat_candidate("shlx", iclass);
         }
 
         // TODO: check XED_IFORM_SHL_GPR32_CL instead of number of memory operands?
@@ -1255,7 +1265,7 @@ static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
 
 end:
         if (stat_reason >= 0) {
-            stat_record(iclass, stat_reason);
+            stat_record("shlx", iclass, stat_reason);
         }
         if (is_basic_block_terminator(&xedd)) {
             history_reset(&history);
@@ -1363,7 +1373,7 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
         const struct inst_history_entry *not_entry =
                 find_adjacent_not(&history, offset, &not_reg);
         if (not_entry != NULL) {
-            stat_candidate(XED_ICLASS_AND);
+            stat_candidate("andn", XED_ICLASS_AND);
         }
         if (xed_decoded_inst_number_of_memory_operands(&xedd) != 0 ||
             xed_decoded_inst_get_immediate_width_bits(&xedd) != 0) {
@@ -1559,7 +1569,7 @@ static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
 
 end:
         if (stat_reason >= 0) {
-            stat_record(XED_ICLASS_AND, stat_reason);
+            stat_record("andn", XED_ICLASS_AND, stat_reason);
         }
         if (is_basic_block_terminator(&xedd)) {
             history_reset(&history);
@@ -1822,7 +1832,7 @@ static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
                 copy_dst != op_dst) {
                 goto end;
             }
-            stat_candidate(iclass);
+            stat_candidate("vex3", iclass);
             unsigned int nmem = xed_decoded_inst_number_of_memory_operands(&xedd);
             if (xed_decoded_inst_get_immediate_width_bits(&xedd) != 0 ||
                 nmem > 1 ||
@@ -1945,7 +1955,423 @@ static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
 
 end:
         if (stat_reason >= 0) {
-            stat_record(iclass, stat_reason);
+            stat_record("vex3", iclass, stat_reason);
+        }
+        if (is_basic_block_terminator(&xedd)) {
+            history_reset(&history);
+        } else {
+            history_push(&history, &xedd, offset);
+        }
+        offset += xed_decoded_inst_get_length(&xedd);
+    }
+    return count;
+}
+
+// Anchor ops for the APX NDD rewrite. Each reads its destination as the
+// first source (RW, or CW for CMOVcc) and its EVEX map 4 promoted form with
+// NF=0 reads and writes EFLAGS exactly like the legacy encoding, so folding
+// a register copy into the new destination operand changes no architectural
+// state. Unlike the VEX table no legacy->new mapping is needed: the promoted
+// forms keep their iclass. IMUL is the two-operand 0F AF form; the immediate
+// IMULs (69/6B) already have a separate destination and never match the
+// candidate shape. NDD immediate forms exist only for the eight ALU entries,
+// which is also the only place the legacy shape can put one.
+static const xed_iclass_enum_t apx_ndd_rules[] = {
+    XED_ICLASS_ADD, XED_ICLASS_ADC, XED_ICLASS_SUB, XED_ICLASS_SBB,
+    XED_ICLASS_AND, XED_ICLASS_OR, XED_ICLASS_XOR, XED_ICLASS_IMUL,
+    XED_ICLASS_CMOVB, XED_ICLASS_CMOVBE, XED_ICLASS_CMOVL, XED_ICLASS_CMOVLE,
+    XED_ICLASS_CMOVNB, XED_ICLASS_CMOVNBE, XED_ICLASS_CMOVNL,
+    XED_ICLASS_CMOVNLE, XED_ICLASS_CMOVNO, XED_ICLASS_CMOVNP,
+    XED_ICLASS_CMOVNS, XED_ICLASS_CMOVNZ, XED_ICLASS_CMOVO, XED_ICLASS_CMOVP,
+    XED_ICLASS_CMOVS, XED_ICLASS_CMOVZ,
+};
+
+static bool apx_ndd_candidate_iclass(int iclass)
+{
+    static bool map[XED_ICLASS_LAST];
+    static bool init;
+    if (!init) {
+        for (size_t i = 0; i < sizeof(apx_ndd_rules) / sizeof(apx_ndd_rules[0]); i++) {
+            map[apx_ndd_rules[i]] = true;
+        }
+        init = true;
+    }
+    if (iclass <= 0 || iclass >= XED_ICLASS_LAST) {
+        return false;
+    }
+    return map[iclass];
+}
+
+// Probe for an adjacent preceding register-to-register GPR MOV. Only plain
+// MOV qualifies: MOVZX/MOVSX/MOVSXD change the value's width, so the op
+// would no longer read the bits the copy produced. Immediate loads have
+// nothing to fold, and segment-register moves share the MOV iclass but fail
+// the GPR class check.
+static const struct inst_history_entry *find_adjacent_gpr_mov(
+        const struct inst_history *h, size_t offset,
+        xed_reg_enum_t *copy_src, xed_reg_enum_t *copy_dst)
+{
+    *copy_src = XED_REG_INVALID;
+    *copy_dst = XED_REG_INVALID;
+    const struct inst_history_entry *e = history_at(h, 1);
+    if (e == NULL ||
+        e->offset + xed_decoded_inst_get_length(&e->xedd) != offset ||
+        xed_decoded_inst_get_iclass(&e->xedd) != XED_ICLASS_MOV ||
+        xed_decoded_inst_number_of_memory_operands(&e->xedd) != 0 ||
+        xed_decoded_inst_get_immediate_width_bits(&e->xedd) != 0) {
+        return NULL;
+    }
+    const xed_inst_t *xi = xed_decoded_inst_inst(&e->xedd);
+    unsigned int n = xed_inst_noperands(xi);
+    for (unsigned int i = 0; i < n; i++) {
+        const xed_operand_t *op = xed_inst_operand(xi, i);
+        if (!xed_operand_is_register(xed_operand_name(op))) {
+            return NULL;
+        }
+        xed_reg_enum_t reg = xed_decoded_inst_get_reg(&e->xedd,
+                                                      xed_operand_name(op));
+        if (xed_reg_class(reg) != XED_REG_CLASS_GPR) {
+            return NULL;
+        }
+        xed_operand_action_enum_t act = xed_operand_rw(op);
+        if (act == XED_OPERAND_ACTION_W) {
+            *copy_dst = reg;
+        } else if (act == XED_OPERAND_ACTION_R) {
+            *copy_src = reg;
+        } else {
+            return NULL;
+        }
+    }
+    if (*copy_src == XED_REG_INVALID || *copy_dst == XED_REG_INVALID) {
+        return NULL;
+    }
+    return e;
+}
+
+// Encode the EVEX map 4 NDD form `iclass %rm, %src1, %dst` (Intel operand
+// order dst, src1, rm; dst lands in EVEX.vvvv). The encoder selects the
+// three-operand APX_F_N3 pattern from the operand signature alone, and a
+// zeroed request leaves NF=0, the flags-writing form. The encoding is new to
+// this pass, so re-decode the result and require the NDD attribute; a
+// surprising encoder outcome must never reach the binary. Shared by the
+// register path and the two-pass RIP-relative memory path.
+static xed_error_enum_t apx_ndd_encode(xed_iclass_enum_t iclass,
+                                       unsigned int eow,
+                                       xed_reg_enum_t dst, xed_reg_enum_t src1,
+                                       xed_encoder_operand_t rm,
+                                       uint8_t *out, unsigned int *out_len)
+{
+    xed_state_t state;
+    xed_state_zero(&state);
+    state.mmode = XED_MACHINE_MODE_LONG_64;
+    state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    xed_encoder_instruction_t enc_inst;
+    xed_inst3(&enc_inst, state, iclass, eow,
+              xed_reg(dst), xed_reg(src1), rm);
+    xed_encoder_request_t req;
+    xed_encoder_request_zero_set_mode(&req, &state);
+    if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+        return XED_ERROR_GENERAL_ERROR;
+    }
+    xed_error_enum_t err = xed_encode(&req, out, XED_MAX_INSTRUCTION_BYTES,
+                                      out_len);
+    if (err != XED_ERROR_NONE) {
+        return err;
+    }
+    xed_decoded_inst_t chk;
+    xed_decoded_inst_zero(&chk);
+    xed_decoded_inst_set_mode(&chk, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&chk, out, *out_len) != XED_ERROR_NONE ||
+        !xed_decoded_inst_get_attribute(&chk, XED_ATTRIBUTE_APX_NDD) ||
+        xed_decoded_inst_get_attribute(&chk, XED_ATTRIBUTE_APX_NF)) {
+        return XED_ERROR_GENERAL_ERROR;
+    }
+    return XED_ERROR_NONE;
+}
+
+static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
+                          const uint8_t *branch_targets);
+
+int check_apx(uint8_t *inst, size_t len, bool replace)
+{
+    size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
+    uint8_t *targets = calloc(bitmap_bytes, 1);
+    if (targets == NULL) {
+        return -1;
+    }
+    collect_branch_targets(inst, len, targets);
+    int result = check_apx_impl(inst, len, replace, targets);
+    free(targets);
+    return result;
+}
+
+// Rewrite a GPR register copy feeding an adjacent two-operand integer op as
+// the op's APX NDD (EVEX map 4) three-operand form:
+//
+//   mov %a,%c; op %b,%c   ->   op %b,%a,%c   (c = a OP b)
+//
+// The legacy op reads its destination as the first source; the NDD form
+// makes that source explicit, so the copy folds away. A memory or immediate
+// source folds into the same slot (`mov %a,%c; add $8,%c` ->
+// `add $8,%a,%c`), recomputing RIP-relative displacements for the new
+// instruction location. Like the VEX rewrite this needs no forward liveness:
+// MOV writes no flags, the promoted form with NF=0 reads and writes EFLAGS
+// exactly like the legacy op (ADC/SBB consume the same incoming CF, CMOVcc
+// tests the same condition), %a and %b hold the same values afterwards, and
+// %c receives the identical result.
+//
+// Requiring the MOV to write exactly the register the op destroys (same
+// enum, hence same width) is what makes the fold sound: a 32-bit copy
+// feeding a 64-bit op relies on the MOV's implicit zero extension, which the
+// NDD form would bypass by reading the full source register. 8- and 16-bit
+// ops are excluded because their NDD forms zero the rest of the 64-bit
+// destination where the legacy pair preserves it. 32/64-bit NDD destinations
+// are written exactly like their legacy counterparts.
+//
+// One architectural difference, not observable by conforming code: with a
+// memory source the legacy sequence executed the MOV before a faulting load,
+// while the NDD form leaves the destination untouched, so a fault handler
+// could see the pre-copy value (the VEX rewrite's alignment caveat is the
+// same kind of trade).
+//
+// Rerunning the pass over its own output is safe: the NDD destination is a
+// pure write rather than a read-modify-write, so a rewritten site no longer
+// matches the candidate shape.
+static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
+                          const uint8_t *branch_targets)
+{
+    int count = 0;
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    struct inst_history history;
+    history_reset(&history);
+
+    for (size_t offset = 0; offset < len;) {
+        int stat_reason = -1;
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+
+        xed_error_enum_t err = xed_decode(&xedd, inst + offset, len - offset);
+        if (err != XED_ERROR_NONE) {
+            fprintf(stderr, "Decoding error at offset: %zu: %s\n", offset,
+                    xed_error_enum_t2str(err));
+            return -1;
+        }
+
+        int iclass = xed_decoded_inst_get_iclass(&xedd);
+        if (!apx_ndd_candidate_iclass(iclass)) {
+            goto end;
+        }
+
+        // Extract the op's register operands tolerantly so memory- and
+        // immediate-source forms still yield op_dst for candidate
+        // accounting. The EFLAGS operand is handled identically by the NDD
+        // form whatever its action (written by the ALU ops, also read by
+        // ADC/SBB, only read by CMOVcc); skip it like ANDN does. CW is
+        // CMOVcc's destination action: the register is written -- fully,
+        // with zero extension -- even when the condition is false.
+        const xed_inst_t *xi = xed_decoded_inst_inst(&xedd);
+        unsigned int n = xed_inst_noperands(xi);
+        xed_reg_enum_t op_dst = XED_REG_INVALID;
+        xed_reg_enum_t op_src = XED_REG_INVALID;
+        bool form_ok = true;
+        for (unsigned int i = 0; i < n; i++) {
+            const xed_operand_t *op = xed_inst_operand(xi, i);
+            xed_operand_enum_t op_name = xed_operand_name(op);
+            if (!xed_operand_is_register(op_name)) {
+                continue;  // memory/immediate pieces; handled separately
+            }
+            xed_reg_enum_t reg = xed_decoded_inst_get_reg(&xedd, op_name);
+            if (reg == XED_REG_EFLAGS || reg == XED_REG_RFLAGS ||
+                reg == XED_REG_FLAGS) {
+                continue;
+            }
+            xed_operand_action_enum_t act = xed_operand_rw(op);
+            if (xed_reg_class(reg) != XED_REG_CLASS_GPR) {
+                form_ok = false;
+            } else if (act == XED_OPERAND_ACTION_RW ||
+                       act == XED_OPERAND_ACTION_CW) {
+                if (op_dst != XED_REG_INVALID) {
+                    form_ok = false;
+                }
+                op_dst = reg;
+            } else if (act == XED_OPERAND_ACTION_R) {
+                if (op_src != XED_REG_INVALID) {
+                    form_ok = false;
+                }
+                op_src = reg;
+            } else {
+                form_ok = false;
+            }
+        }
+
+        {
+            xed_reg_enum_t copy_src = XED_REG_INVALID;
+            xed_reg_enum_t copy_dst = XED_REG_INVALID;
+            const struct inst_history_entry *copy_entry =
+                    find_adjacent_gpr_mov(&history, offset, &copy_src,
+                                          &copy_dst);
+            // Exact register equality doubles as the width gate; see the
+            // header comment.
+            if (copy_entry == NULL || op_dst == XED_REG_INVALID ||
+                copy_dst != op_dst) {
+                goto end;
+            }
+            stat_candidate("apx", iclass);
+            unsigned int nmem = xed_decoded_inst_number_of_memory_operands(&xedd);
+            unsigned int imm_bits = xed_decoded_inst_get_immediate_width_bits(&xedd);
+            if (nmem > 1 || (nmem == 1 && imm_bits != 0) ||
+                (nmem == 1 && (!xed_decoded_inst_mem_read(&xedd, 0) ||
+                               xed_decoded_inst_mem_written(&xedd, 0)))) {
+                stat_reason = STAT_MEM_OR_IMM_OPERAND;
+                goto end;
+            }
+            if (!form_ok ||
+                (nmem == 0 && imm_bits == 0 && op_src == XED_REG_INVALID)) {
+                stat_reason = STAT_FORM_ODD;
+                goto end;
+            }
+            unsigned int eow = xed_get_register_width_bits(op_dst);
+            if (eow != 32 && eow != 64) {
+                stat_reason = STAT_WIDTH_NOT_32_64;
+                goto end;
+            }
+
+            xed_encoder_operand_t op_rm;
+            bool rip_mem = false;
+            int64_t rip_target = 0;
+            if (nmem == 1) {
+                xed_reg_enum_t mem_base = xed_decoded_inst_get_base_reg(&xedd, 0);
+                xed_reg_enum_t mem_index = xed_decoded_inst_get_index_reg(&xedd, 0);
+                if (mem_base == XED_REG_EIP) {
+                    stat_reason = STAT_FORM_ODD;
+                    goto end;
+                }
+                // The legacy sequence computes the address after the MOV,
+                // the rewrite before it, so an address that reads the copy's
+                // destination would use a stale value:
+                //   mov %rdi,%rax; add (%rax),%rax
+                // An address reading the copy's source is fine; that
+                // register does not change.
+                if ((mem_base != XED_REG_INVALID &&
+                     xed_get_largest_enclosing_register(mem_base) ==
+                     xed_get_largest_enclosing_register(copy_dst)) ||
+                    (mem_index != XED_REG_INVALID &&
+                     xed_get_largest_enclosing_register(mem_index) ==
+                     xed_get_largest_enclosing_register(copy_dst))) {
+                    stat_reason = STAT_MEM_ADDR_USES_DST;
+                    goto end;
+                }
+                int64_t disp = xed_decoded_inst_get_memory_displacement(&xedd, 0);
+                xed_uint_t disp_width_bits =
+                        xed_decoded_inst_get_memory_displacement_width_bits(&xedd, 0);
+                if (mem_base == XED_REG_RIP) {
+                    // The displacement depends on the NDD instruction's
+                    // length, so encode with a placeholder first and patch
+                    // in a second pass below.
+                    rip_mem = true;
+                    rip_target = (int64_t)offset +
+                                 (int64_t)xed_decoded_inst_get_length(&xedd) +
+                                 disp;
+                    disp = 0;
+                    disp_width_bits = 32;
+                }
+                op_rm = xed_mem_gbisd(
+                        xed_decoded_inst_get_seg_reg(&xedd, 0),
+                        mem_base,
+                        mem_index,
+                        xed_decoded_inst_get_scale(&xedd, 0),
+                        xed_disp(disp, disp_width_bits),
+                        xed_decoded_inst_get_memory_operand_length(&xedd, 0) * 8);
+            } else if (imm_bits != 0) {
+                // Re-encoding the same value at the same width reproduces
+                // the sign-extended imm8 vs full-width immediate split in
+                // the promoted opcode.
+                op_rm = xed_imm0(xed_decoded_inst_get_unsigned_immediate(&xedd),
+                                 imm_bits);
+            } else {
+                // If the op's source is also its destination, that source
+                // holds the copied value, so the rewrite must read the
+                // copy's source:
+                //   mov %a,%c; add %c,%c  ->  add %a,%a,%c  (= a + a)
+                if (op_src == op_dst) {
+                    op_src = copy_src;
+                }
+                op_rm = xed_reg(op_src);
+            }
+
+            uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
+            unsigned int new_len = 0;
+            if (apx_ndd_encode(iclass, eow, op_dst, copy_src, op_rm,
+                               new_bytes, &new_len) != XED_ERROR_NONE) {
+                stat_reason = STAT_ENCODE_FAIL;
+                goto end;
+            }
+            if (rip_mem) {
+                // RIP forms always carry a disp32, so re-encoding with the
+                // real displacement cannot change the length; refuse if it
+                // somehow does.
+                int64_t disp = rip_target -
+                               (int64_t)(copy_entry->offset + new_len);
+                if (disp < INT32_MIN || disp > INT32_MAX) {
+                    stat_reason = STAT_ENCODE_FAIL;
+                    goto end;
+                }
+                op_rm = xed_mem_gbisd(
+                        xed_decoded_inst_get_seg_reg(&xedd, 0),
+                        XED_REG_RIP,
+                        xed_decoded_inst_get_index_reg(&xedd, 0),
+                        xed_decoded_inst_get_scale(&xedd, 0),
+                        xed_disp(disp, 32),
+                        xed_decoded_inst_get_memory_operand_length(&xedd, 0) * 8);
+                unsigned int len2 = 0;
+                if (apx_ndd_encode(iclass, eow, op_dst, copy_src, op_rm,
+                                   new_bytes, &len2) != XED_ERROR_NONE ||
+                    len2 != new_len) {
+                    stat_reason = STAT_ENCODE_FAIL;
+                    goto end;
+                }
+            }
+
+            unsigned int old_len = (offset + xed_decoded_inst_get_length(&xedd)) -
+                                   copy_entry->offset;
+            if (new_len > old_len) {
+                stat_reason = STAT_TOO_LONG;
+                goto end;
+            }
+            size_t rewrite_end = offset + xed_decoded_inst_get_length(&xedd);
+            if (target_in_interior(branch_targets, copy_entry->offset,
+                                   rewrite_end)) {
+                stat_reason = STAT_BRANCH_TARGET_INTERIOR;
+                goto end;
+            }
+
+            printf("R apx %s %s, %s, %s [%u bytes, replacing %u]\n",
+                    xed_iclass_enum_t2str(iclass),
+                    xed_reg_enum_t2str(op_dst), xed_reg_enum_t2str(copy_src),
+                    nmem == 1 ? "mem" :
+                            imm_bits != 0 ? "imm" : xed_reg_enum_t2str(op_src),
+                    new_len, old_len);
+            stat_reason = STAT_REWRITTEN;
+            ++count;
+
+            if (replace) {
+                uint8_t *addr = inst + copy_entry->offset;
+                memcpy(addr, new_bytes, new_len);
+                if (old_len > new_len) {
+                    if (xed_encode_nop(addr + new_len,
+                                       old_len - new_len) != XED_ERROR_NONE) {
+                        return -1;
+                    }
+                }
+            }
+        }
+
+end:
+        if (stat_reason >= 0) {
+            stat_record("apx", iclass, stat_reason);
         }
         if (is_basic_block_terminator(&xedd)) {
             history_reset(&history);

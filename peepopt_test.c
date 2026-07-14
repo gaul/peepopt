@@ -58,6 +58,28 @@ static void check_replace(int line, int expected_count,
     }
 }
 
+static void check_apx_replace(int line, int expected_count,
+                              const uint8_t *expect, size_t expect_len,
+                              uint8_t *bytes, size_t len)
+{
+    int got = check_apx(bytes, len, /*replace=*/ true);
+    if (got != expected_count) {
+        fprintf(stderr, "peepopt_test.c:%d: check_apx returned %d, expected %d\n",
+                line, got, expected_count);
+        ++failures;
+        return;
+    }
+    if (len != expect_len || memcmp(bytes, expect, len) != 0) {
+        fprintf(stderr, "peepopt_test.c:%d: buffer mismatch after replace\n", line);
+        fprintf(stderr, "  got:     ");
+        for (size_t i = 0; i < len; ++i) fprintf(stderr, "%02X ", bytes[i]);
+        fprintf(stderr, "\n  expect:  ");
+        for (size_t i = 0; i < expect_len; ++i) fprintf(stderr, "%02X ", expect[i]);
+        fprintf(stderr, "\n");
+        ++failures;
+    }
+}
+
 int main(int argc, char *argv[])
 {
     (void)argc; (void)argv;
@@ -1108,6 +1130,330 @@ int main(int argc, char *argv[])
         0xEB, 0x03,              // jmp .+3 (targets the addss below)
         0x0F, 0x28, 0xD1,        // movaps %xmm1,%xmm2
         0xF3, 0x0F, 0x58, 0xD3,  // addss  %xmm3,%xmm2   <- branch target
+        0xC3
+    );
+
+    /* ================= APX NDD tests ================= */
+
+    #define CHECK_APX(expected, ...) \
+    do { \
+        uint8_t bytes[] = { __VA_ARGS__ }; \
+        int got = check_apx(bytes, sizeof(bytes), /*replace=*/ false); \
+        if (got != (expected)) { \
+            fprintf(stderr, "%s:%d: check_apx returned %d, expected %d\n", \
+                    __FILE__, __LINE__, got, (expected)); \
+            ++failures; \
+        } \
+    } while (0)
+
+    /* `mov %rsi,%rax; add %rcx,%rax` == rax = rsi + rcx ==
+       `add %rcx,%rsi,%rax`. The 64-bit pair is six bytes and the EVEX map 4
+       form is six bytes: an exact fit with no NOP. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x01, 0xC8,                    // add %rcx,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x01, 0xCE,  // add %rcx,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Non-commutative op: the copy source must land in EVEX.vvvv's partner
+       slot as the minuend. sub %rcx,%rbx,%rax = rbx - rcx. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xD8,                    // mov %rbx,%rax
+            0x48, 0x29, 0xC8,                    // sub %rcx,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x29, 0xCB,  // sub %rcx,%rbx,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Op source == op destination reads the copied value, so the rewrite
+       must substitute the copy source: add %rax,%rax after the copy computes
+       rsi+rsi, not rsi+rax_orig. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x01, 0xC0,                    // add %rax,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x01, 0xF6,  // add %rsi,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* A 32-bit pair without REX prefixes is only four bytes; the six-byte
+       EVEX form cannot fit. */
+    CHECK_APX(
+        0,
+        0x89, 0xF0,              // mov %esi,%eax
+        0x01, 0xC8,              // add %ecx,%eax
+        0xC3
+    );
+
+    /* Extended registers give both legacy instructions a REX prefix, so the
+       32-bit pair reaches six bytes and fits exactly. */
+    {
+        uint8_t bytes[] = {
+            0x45, 0x89, 0xC1,                    // mov %r8d,%r9d
+            0x45, 0x01, 0xD1,                    // add %r10d,%r9d
+        };
+        const uint8_t expect[] = {
+            0x62, 0x54, 0x34, 0x18, 0x01, 0xD0,  // add %r10d,%r8d,%r9d
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Soundness: width-changing copies are not folds. MOVZX would make the
+       op read unzero-extended source bits... */
+    CHECK_APX(
+        0,
+        0x48, 0x0F, 0xB6, 0xD9,  // movzbq %cl,%rbx
+        0x48, 0x01, 0xCB,        // add %rcx,%rbx
+        0xC3
+    );
+
+    /* ...and MOVSXD likewise (the pair is seven bytes, so only the MOV-only
+       check refuses it). */
+    CHECK_APX(
+        0,
+        0x48, 0x63, 0xC6,        // movslq %esi,%rax
+        0x48, 0x01, 0xC8,        // add %rcx,%rax
+        0xC3
+    );
+
+    /* Soundness: a 32-bit copy feeding a 64-bit op relies on the MOV's zero
+       extension, which the NDD form would bypass by reading all of the
+       source register. Extended registers make the pair six bytes, so only
+       the exact-register match refuses it. */
+    CHECK_APX(
+        0,
+        0x44, 0x89, 0xC0,        // mov %r8d,%eax     (32-bit)
+        0x48, 0x01, 0xC8,        // add %rcx,%rax     (64-bit)
+        0xC3
+    );
+
+    /* Soundness: 16-bit NDD forms zero the upper destination bits where the
+       legacy pair preserves them. */
+    CHECK_APX(
+        0,
+        0x66, 0x89, 0xF0,        // mov %si,%ax
+        0x66, 0x01, 0xC8,        // add %cx,%ax
+        0xC3
+    );
+
+    /* ADC reads the same incoming CF at the same program point. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x11, 0xC8,                    // adc %rcx,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x11, 0xCE,  // adc %rcx,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* CMOVcc's destination action is CW rather than RW, and its legacy
+       encoding is an 0F-map escape, leaving one slack byte for a NOP. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x0F, 0x44, 0xC1,              // cmovz %rcx,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x44, 0xF1,  // cmovz %rcx,%rsi,%rax
+            0x90,                                // 1-byte NOP
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Two-operand IMUL promotes the same way. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x0F, 0xAF, 0xC1,              // imul %rcx,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xAF, 0xF1,  // imul %rcx,%rsi,%rax
+            0x90,                                // 1-byte NOP
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* The copy must be byte-adjacent. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF0,        // mov %rsi,%rax
+        0x90,                    // nop
+        0x48, 0x01, 0xC8,        // add %rcx,%rax
+        0xC3
+    );
+
+    /* Copy feeding a different register is not a candidate. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF3,        // mov %rsi,%rbx
+        0x48, 0x01, 0xC8,        // add %rcx,%rax
+        0xC3
+    );
+
+    /* Ops outside the whitelist (CMP writes no register) are skipped. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF0,        // mov %rsi,%rax
+        0x48, 0x39, 0xC8,        // cmp %rcx,%rax
+        0xC3
+    );
+
+    /* A branch target between copy and op must refuse. */
+    CHECK_APX(
+        0,
+        0xEB, 0x03,              // jmp .+3 (targets the add below)
+        0x48, 0x89, 0xF0,        // mov %rsi,%rax
+        0x48, 0x01, 0xC8,        // add %rcx,%rax   <- branch target
+        0xC3
+    );
+
+    /* Truncated instruction is a decode error. */
+    CHECK_APX(-1, 0x0F);
+
+    /* Memory-source ops fold into the EVEX r/m slot; REX.W legacy plus
+       modrm/disp matches the EVEX form exactly. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x03, 0x47, 0x08,              // add 0x8(%rdi),%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x03, 0x77, 0x08,  // add 0x8(%rdi),%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* RIP-relative memory source: the NDD instruction sits at the copy's
+       offset. Original target = 3 + 7 + 0x20 = 0x2A; the EVEX form is 10
+       bytes at offset 0, so the displacement stays 0x2A - 10 = 0x20. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x03, 0x05,                    // add 0x20(%rip),%rax
+            0x20, 0x00, 0x00, 0x00,
+            0xC3,
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x03, 0x35,  // add 0x20(%rip),%rsi,%rax
+            0x20, 0x00, 0x00, 0x00,
+            0xC3,
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Soundness: an address reading the copy's destination would use the
+       stale pre-copy value once the MOV is folded away. The pair fits the
+       byte budget, so only the alias gate refuses it. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF8,        // mov %rdi,%rax
+        0x48, 0x03, 0x00,        // add (%rax),%rax
+        0xC3
+    );
+
+    /* ...including via the index register. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF8,        // mov %rdi,%rax
+        0x48, 0x03, 0x04, 0x46,  // add (%rsi,%rax,2),%rax
+        0xC3
+    );
+
+    /* An address reading the copy's *source* is fine; that register does
+       not change. */
+    CHECK_APX(
+        1,
+        0x48, 0x89, 0xF8,        // mov %rdi,%rax
+        0x48, 0x03, 0x07,        // add (%rdi),%rax
+        0xC3
+    );
+
+    /* Memory destinations have no register to fold into. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF0,        // mov %rsi,%rax
+        0x48, 0x01, 0x01,        // add %rax,(%rcx)
+        0xC3
+    );
+
+    /* Immediate sources fold too; the sign-extended imm8 form matches the
+       seven-byte legacy pair exactly. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x83, 0xC0, 0x64,              // add $100,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x83, 0xC6, 0x64,  // add $100,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* A negative imm8 must round-trip as the same sign-extended byte. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x83, 0xC0, 0xF8,              // add $-8,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x83, 0xC6, 0xF8,  // add $-8,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* The RAX short form (opcode 0x05) has no modrm byte, so the pair is
+       nine bytes but the EVEX immz form needs ten. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF0,                          // mov %rsi,%rax
+        0x48, 0x05, 0x64, 0x00, 0x00, 0x00,        // add $100,%rax (short form)
+        0xC3
+    );
+
+    /* The modrm imm32 form is ten bytes and matches exactly. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0x81, 0xC0,                    // add $100,%rax
+            0x64, 0x00, 0x00, 0x00,
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x81, 0xC6,  // add $100,%rsi,%rax
+            0x64, 0x00, 0x00, 0x00,
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* 32-bit immediate pair without REX is too short, like the reg form. */
+    CHECK_APX(
+        0,
+        0x89, 0xF0,              // mov %esi,%eax
+        0x83, 0xC0, 0x64,        // add $100,%eax
         0xC3
     );
 

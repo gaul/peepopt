@@ -1,0 +1,101 @@
+// Deterministic MOV+op candidates for the APX NDD end-to-end test
+// (test-apx.sh). Each body is hand-written so `peepopt -m apx` rewrites a
+// known set of sites; nothing here uses CL-count shifts, NOT+AND, or SSE
+// copy+op pairs, so the always-on passes leave these bodies alone.
+
+    .text
+
+    .globl apx_add64
+    .type apx_add64, @function
+apx_add64:
+    mov %rdi, %rax
+    add %rsi, %rax
+    ret
+
+    // Non-commutative: rax = rdi - rsi.
+    .globl apx_sub64
+    .type apx_sub64, @function
+apx_sub64:
+    mov %rdi, %rax
+    sub %rsi, %rax
+    ret
+
+    // Op source == op destination exercises the copy-source substitution.
+    .globl apx_add_same
+    .type apx_add_same, @function
+apx_add_same:
+    mov %rdi, %rax
+    add %rax, %rax
+    ret
+
+    // 32-bit pair whose REX prefixes make it big enough to rewrite.
+    .globl apx_xor32_ext
+    .type apx_xor32_ext, @function
+apx_xor32_ext:
+    mov %edi, %r8d
+    xor %esi, %r8d
+    mov %r8d, %eax
+    ret
+
+    // Negative control: a REX-less 32-bit pair is too short to rewrite and
+    // must keep behaving identically.
+    .globl apx_add32_norex
+    .type apx_add32_norex, @function
+apx_add32_norex:
+    mov %edi, %eax
+    add %esi, %eax
+    ret
+
+    // Memory source folds into the EVEX r/m slot: rax = rsi + (%rdi).
+    .globl apx_mem64
+    .type apx_mem64, @function
+apx_mem64:
+    mov %rsi, %rax
+    add (%rdi), %rax
+    ret
+
+    // The rewritten ADC must consume the CF produced just before it.
+    .globl apx_adc64
+    .type apx_adc64, @function
+apx_adc64:
+    add %rsi, %rdi
+    mov %rdx, %rax
+    adc %rcx, %rax
+    ret
+
+    // The rewritten ADD must still produce CF (NF=0): dl = carry(x + y).
+    .globl apx_flags_after
+    .type apx_flags_after, @function
+apx_flags_after:
+    xor %edx, %edx
+    mov %rdi, %rax
+    add %rsi, %rax
+    setc %dl
+    add %rdx, %rax
+    ret
+
+    // CMOVcc keeps its condition read: rax = (rdi < rsi) ? rcx : rdx.
+    .globl apx_cmov
+    .type apx_cmov, @function
+apx_cmov:
+    cmp %rsi, %rdi
+    mov %rdx, %rax
+    cmovb %rcx, %rax
+    ret
+
+    .globl apx_imul
+    .type apx_imul, @function
+apx_imul:
+    mov %rdi, %rax
+    imul %rsi, %rax
+    ret
+
+    // Immediate source folds too.
+    .globl apx_imm
+    .type apx_imm, @function
+apx_imm:
+    mov %rdi, %rax
+    add $100, %rax
+    ret
+
+    .section .note.GNU-stack,"",@progbits

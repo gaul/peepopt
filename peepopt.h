@@ -25,5 +25,6 @@ void peepopt_print_stats(void);
 int check_shifts(uint8_t *inst, size_t len, bool replace);
 int check_andn(uint8_t *inst, size_t len, bool replace);
 int check_vex3(uint8_t *inst, size_t len, bool replace);
+int check_apx(uint8_t *inst, size_t len, bool replace);
 
 #endif

@@ -34,7 +34,7 @@ static void usage(const char *program)
 {
     fprintf(stderr,
             "peepopt optimizes x86-64 binaries, rewriting them in-place\n" \
-            "usage: %s [--dry-run] [--stats] [--verbose] <ELF_FILE>\n", program);
+            "usage: %s [--dry-run] [--stats] [--verbose] [-m|--march apx] <ELF_FILE>\n", program);
     exit(EXIT_FAILURE);
 }
 
@@ -45,18 +45,33 @@ int main(int argc, char **argv)
     bool dry_run = false;
     bool stats = false;
     bool verbose = false;
+    bool march_apx = false;
     static const struct option long_opts[] = {
         { "dry-run", no_argument,       0, 'd' },
+        { "march",   required_argument, 0, 'm' },
         { "stats",   no_argument,       0, 's' },
         { "verbose", no_argument,       0, 'v' },
         { NULL,      0,                 0,  0  }
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "vq", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "vm:", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'd':
             dry_run = true;
+            break;
+        case 'm':
+            // Comma-separated ISA extensions beyond the always-on
+            // x86-64-v3 rewrites. Only APX exists today.
+            for (char *tok = strtok(optarg, ","); tok != NULL;
+                 tok = strtok(NULL, ",")) {
+                if (strcmp(tok, "apx") == 0) {
+                    march_apx = true;
+                } else {
+                    fprintf(stderr, "unknown -m feature: %s\n", tok);
+                    usage(argv[0]);
+                }
+            }
             break;
         case 's':
             stats = true;
@@ -205,6 +220,16 @@ int main(int argc, char **argv)
             return 1;
         }
         rewrites += vex3_rewrites;
+        if (march_apx) {
+            int apx_rewrites = check_apx(buf, section_header->sh_size, /*replace=*/ !dry_run);
+            if (apx_rewrites < 0) {
+                fprintf(stderr, "check_apx failed on section %u\n", idx);
+                munmap(addr, file_size);
+                close(fd);
+                return 1;
+            }
+            rewrites += apx_rewrites;
+        }
     }
 
     if (stats) {

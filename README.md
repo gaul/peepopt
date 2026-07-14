@@ -47,7 +47,7 @@ When rewriting instructions peepopt examines subsequent instructions to ensure t
 
 ## Transformations
 
-peepopt currently implements three families of rewrites, all within the x86-64-v3 feature level (BMI1, BMI2, AVX).
+peepopt currently implements three always-on families of rewrites within the x86-64-v3 feature level (BMI1, BMI2, AVX), plus an opt-in APX family (`-m apx`).
 Every replacement fits within the bytes of the original instructions — shorter replacements are padded with no-ops — and is refused when a branch targets the interior of the rewritten range.
 
 ### Variable shifts: SHL/SHR/SAR → SHLX/SHRX/SARX (BMI2)
@@ -107,6 +107,29 @@ C5F958D1       vaddpd %xmm1,%xmm0,%xmm2
 A memory source folds into the VEX form the same way (`movapd %xmm4,%xmm5; addsd 8(%rax),%xmm5` → `vaddsd 8(%rax),%xmm4,%xmm5`), recomputing RIP-relative displacements for the new instruction location.
 Unlike the integer rewrites this needs no forward analysis: neither instruction touches `EFLAGS` and every register holds the same value afterward.
 
+### MOV + integer op → APX NDD three-operand form (`-m apx`)
+
+Two-operand integer instructions destroy their first source, so compilers copy values that are still needed:
+
+```
+4889F0         mov %rsi,%rax
+4801C8         add %rcx,%rax
+```
+
+[Intel APX](https://en.wikipedia.org/wiki/X86#APX) promotes the legacy integer ops to EVEX (map 4) forms with a *new data destination*, folding the copy away:
+
+```
+62F4FC1801CE   add %rcx,%rsi,%rax
+```
+
+ADD, ADC, SUB, SBB, AND, OR, and XOR are rewritten with register, memory, or immediate sources; two-operand IMUL and the sixteen CMOVcc with register or memory sources (their promoted immediate forms do not exist).
+Like the VEX rewrite this needs no forward analysis: the promoted forms with `NF=0` read and write `EFLAGS` exactly like their legacy encodings (ADC/SBB consume the same incoming carry), every source register keeps its value, and the destination receives the identical result.
+The MOV must write exactly the register the op destroys: a narrower copy feeding a wider op relies on the MOV's zero extension, and 8/16-bit ops are excluded because their promoted forms zero the rest of the destination.
+A memory address that reads the copy's destination would compute from a stale value once the MOV is folded away, so those sites are refused.
+The 64-bit register pair and the EVEX form are both six bytes, an exact fit; REX-less 32-bit pairs are two bytes too short and stay legacy.
+
+Because APX requires very new processors (Panther Lake / Diamond Rapids and later), this family is opt-in via `-m apx` and is validated under the [Intel Software Development Emulator](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html): `make test-apx` rewrites an assembly fixture, diffs its output under `sde64 -dmr` against a native baseline, and checks SDE's instruction-mix histogram to prove NDD instructions actually executed.
+
 ## Optimizing existing binaries
 
 Currently peepopt only does the simple replacements described above that can be done without increasing or decreasing the number of instruction bytes.
@@ -146,6 +169,13 @@ cd peepopt
 XED_PATH=/path/to/xed make all
 ```
 
+Run the unit tests with `make test`.
+The APX end-to-end test additionally needs an [Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) kit:
+
+```
+XED_PATH=/path/to/xed SDE_PATH=/path/to/sde make test-apx
+```
+
 ## Usage
 
 * `peepopt --dry-run program_file`
@@ -154,11 +184,13 @@ XED_PATH=/path/to/xed make all
   - Optimize the input binary with replacement instructions
 * `peepopt --dry-run --stats program_file`
   - Also print a histogram of why each candidate site was or was not rewritten
+* `peepopt -m apx program_file`
+  - Also apply the APX rewrites; the output requires an APX processor or emulator
 
 ## Future directions
 
 * [10-15 byte no-ops](https://reviews.llvm.org/D75945) - optimal on Sandy Bridge and newer only but Atom and Zen perform poorly
-* [APX](https://en.wikipedia.org/wiki/X86#APX) - expanded three-operand and no flag instructions, supported by Panther Lake and newer processors
+* more [APX](https://en.wikipedia.org/wiki/X86#APX) - NDD forms of NEG/NOT/INC/DEC and shift-by-immediate, no-flag (NF) variants, and extended GPRs (R16-R31)
 * [BMI](https://en.wikipedia.org/wiki/X86_Bit_manipulation_instruction_set) - more flexible bit manipulations
 * FSRM - improve memory copies on Ice Lake and newer processors
   - difficult replacement due more complicated register usage
