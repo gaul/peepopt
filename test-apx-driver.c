@@ -34,6 +34,12 @@ uint64_t apx_flags_after(uint64_t x, uint64_t y);
 uint64_t apx_cmov(uint64_t a, uint64_t b, uint64_t x, uint64_t y);
 uint64_t apx_imul(uint64_t x, uint64_t y);
 uint64_t apx_imm(uint64_t x);
+uint64_t apx_neg64(uint64_t x);
+uint64_t apx_not64(uint64_t x);
+uint64_t apx_inc64(uint64_t x, uint64_t y);
+uint64_t apx_shl_imm(uint64_t x);
+uint64_t apx_rol_imm(uint64_t x);
+uint64_t apx_shr_cl(uint64_t x, uint64_t u1, uint64_t u2, uint64_t count);
 
 int main(void)
 {
@@ -62,6 +68,12 @@ int main(void)
             printf("cmov=%" PRIx64 "\n", apx_cmov(x, y, x + 1, y + 1));
             printf("imul=%" PRIx64 "\n", apx_imul(x, y));
             printf("imm=%" PRIx64 "\n", apx_imm(x));
+            printf("neg64=%" PRIx64 "\n", apx_neg64(x));
+            printf("not64=%" PRIx64 "\n", apx_not64(x));
+            printf("inc64=%" PRIx64 "\n", apx_inc64(x, y));
+            printf("shl_imm=%" PRIx64 "\n", apx_shl_imm(x));
+            printf("rol_imm=%" PRIx64 "\n", apx_rol_imm(x));
+            printf("shr_cl=%" PRIx64 "\n", apx_shr_cl(x, 0, 0, y));
         }
     }
     return 0;

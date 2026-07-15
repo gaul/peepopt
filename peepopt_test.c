@@ -1457,5 +1457,201 @@ int main(int argc, char *argv[])
         0xC3
     );
 
+    /* ------ Unary NDD forms: two operands, no second source. ------ */
+
+    /* mov %rsi,%rax; neg %rax == rax = -rsi == neg %rsi,%rax; the 64-bit
+       pair and the EVEX form are both six bytes. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0xF7, 0xD8,                    // neg %rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xF7, 0xDE,  // neg %rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0xF7, 0xD0,                    // not %rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xF7, 0xD6,  // not %rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* INC/DEC preserve CF exactly like their legacy forms. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0xFF, 0xC0,                    // inc %rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xFF, 0xC6,  // inc %rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0xFF, 0xC8,                    // dec %rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xFF, 0xCE,  // dec %rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* 32-bit unary with extended registers fits like the binary ops... */
+    {
+        uint8_t bytes[] = {
+            0x45, 0x89, 0xC1,                    // mov %r8d,%r9d
+            0x41, 0xF7, 0xD9,                    // neg %r9d
+        };
+        const uint8_t expect[] = {
+            0x62, 0xD4, 0x34, 0x18, 0xF7, 0xD8,  // neg %r8d,%r9d
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* ...and the REX-less 32-bit pair is too short. */
+    CHECK_APX(
+        0,
+        0x89, 0xF0,              // mov %esi,%eax
+        0xF7, 0xD8,              // neg %eax
+        0xC3
+    );
+
+    /* ------ Shift and rotate NDD forms. ------ */
+
+    /* The immediate count rides along: the seven-byte legacy pair matches
+       the imm8 EVEX form exactly. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                          // mov %rsi,%rax
+            0x48, 0xC1, 0xE0, 0x05,                    // shl $5,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xC1, 0xE6, 0x05,  // shl $5,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                          // mov %rsi,%rax
+            0x48, 0xC1, 0xE8, 0x05,                    // shr $5,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xC1, 0xEE, 0x05,  // shr $5,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                          // mov %rsi,%rax
+            0x48, 0xC1, 0xF8, 0x05,                    // sar $5,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xC1, 0xFE, 0x05,  // sar $5,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                          // mov %rsi,%rax
+            0x48, 0xC1, 0xC0, 0x0D,                    // rol $13,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xC1, 0xC6, 0x0D,  // rol $13,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                          // mov %rsi,%rax
+            0x48, 0xC1, 0xC8, 0x0D,                    // ror $13,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xC1, 0xCE, 0x0D,  // ror $13,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* 32-bit shift with extended registers. */
+    {
+        uint8_t bytes[] = {
+            0x45, 0x89, 0xC1,                          // mov %r8d,%r9d
+            0x41, 0xC1, 0xE9, 0x03,                    // shr $3,%r9d
+        };
+        const uint8_t expect[] = {
+            0x62, 0xD4, 0x34, 0x18, 0xC1, 0xE8, 0x03,  // shr $3,%r8d,%r9d
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* A REX-less 32-bit shift pair is five bytes, the EVEX form seven. */
+    CHECK_APX(
+        0,
+        0x89, 0xF0,              // mov %esi,%eax
+        0xC1, 0xE0, 0x05,        // shl $5,%eax
+        0xC3
+    );
+
+    /* The CL count also rides along. This copy stages the shifted value,
+       not the count, so it is no SHLX candidate; the fused form reads the
+       same CL at the same program point. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,                    // mov %rsi,%rax
+            0x48, 0xD3, 0xE0,                    // shl %cl,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xD3, 0xE6,  // shl %cl,%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Soundness: a copy destination in the RCX family rewrote the count the
+       legacy shift then used; the fused form would read the stale CL. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0xF1,        // mov %rsi,%rcx
+        0x48, 0xD3, 0xE1,        // shl %cl,%rcx
+        0xC3
+    );
+
+    /* A copy *source* in the RCX family is fine: CL does not change. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xC8,                    // mov %rcx,%rax
+            0x48, 0xD3, 0xE0,                    // shl %cl,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xD3, 0xE1,  // shl %cl,%rcx,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

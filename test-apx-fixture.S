@@ -1,7 +1,8 @@
 // Deterministic MOV+op candidates for the APX NDD end-to-end test
 // (test-apx.sh). Each body is hand-written so `peepopt -m apx` rewrites a
-// known set of sites; nothing here uses CL-count shifts, NOT+AND, or SSE
-// copy+op pairs, so the always-on passes leave these bodies alone.
+// known set of sites; nothing here stages a shift count into %rcx, uses
+// NOT+AND, or SSE copy+op pairs, so the always-on passes leave these bodies
+// alone.
 
     .text
 
@@ -96,6 +97,61 @@ apx_imul:
 apx_imm:
     mov %rdi, %rax
     add $100, %rax
+    ret
+
+    // Unary NDD forms.
+    .globl apx_neg64
+    .type apx_neg64, @function
+apx_neg64:
+    mov %rdi, %rax
+    neg %rax
+    ret
+
+    .globl apx_not64
+    .type apx_not64, @function
+apx_not64:
+    mov %rdi, %rax
+    not %rax
+    ret
+
+    // The rewritten INC must preserve the CF the first add produced.
+    .globl apx_inc64
+    .type apx_inc64, @function
+apx_inc64:
+    xor %edx, %edx
+    add %rsi, %rdi
+    mov %rdi, %rax
+    inc %rax
+    setc %dl
+    add %rdx, %rax
+    ret
+
+    // The rewritten immediate shift must still produce CF (NF=0).
+    .globl apx_shl_imm
+    .type apx_shl_imm, @function
+apx_shl_imm:
+    xor %edx, %edx
+    mov %rdi, %rax
+    shl $5, %rax
+    setc %dl
+    add %rdx, %rax
+    ret
+
+    .globl apx_rol_imm
+    .type apx_rol_imm, @function
+apx_rol_imm:
+    mov %rdi, %rax
+    rol $13, %rax
+    ret
+
+    // Shift by CL: the count arrives in the fourth argument register, so no
+    // count-staging MOV exists for the always-on SHLX pass to claim; only
+    // the APX pass can fold the value copy.
+    .globl apx_shr_cl
+    .type apx_shr_cl, @function
+apx_shr_cl:
+    mov %rdi, %rax
+    shr %cl, %rax
     ret
 
     .section .note.GNU-stack,"",@progbits

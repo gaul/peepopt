@@ -123,6 +123,9 @@ Two-operand integer instructions destroy their first source, so compilers copy v
 ```
 
 ADD, ADC, SUB, SBB, AND, OR, and XOR are rewritten with register, memory, or immediate sources; two-operand IMUL and the sixteen CMOVcc with register or memory sources (their promoted immediate forms do not exist).
+NEG, NOT, INC, and DEC fold the same way into two-operand promoted forms (`mov %rdi,%rax; neg %rax` → `neg %rdi,%rax`), and SHL, SHR, SAR, ROL, and ROR fold with their immediate or `%cl` count carried over.
+The promoted forms write `EFLAGS` exactly like their legacy encodings — INC/DEC still preserve CF and a zero shift count still writes nothing — so unlike the SHLX rewrite no forward flag analysis is needed.
+A `%cl`-count shift whose destination is in the RCX family is refused: the legacy sequence shifts by the count the copy itself just wrote.
 Like the VEX rewrite this needs no forward analysis: the promoted forms with `NF=0` read and write `EFLAGS` exactly like their legacy encodings (ADC/SBB consume the same incoming carry), every source register keeps its value, and the destination receives the identical result.
 The MOV must write exactly the register the op destroys: a narrower copy feeding a wider op relies on the MOV's zero extension, and 8/16-bit ops are excluded because their promoted forms zero the rest of the destination.
 A memory address that reads the copy's destination would compute from a stale value once the MOV is folded away, so those sites are refused.

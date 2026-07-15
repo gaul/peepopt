@@ -50,6 +50,7 @@ enum stat_reason {
     STAT_REWRITTEN,
     STAT_MEM_OR_IMM_OPERAND,
     STAT_MEM_ADDR_USES_DST,
+    STAT_COUNT_ALIASES_DST,
     STAT_FORM_ODD,
     STAT_NO_DEF_IN_WINDOW,
     STAT_DEF_READ_BEFORE,
@@ -79,6 +80,7 @@ static const char *const stat_names[STAT_COUNT] = {
     [STAT_REWRITTEN]               = "rewritten",
     [STAT_MEM_OR_IMM_OPERAND]      = "memory operand or immediate",
     [STAT_MEM_ADDR_USES_DST]       = "memory address reads the copy destination",
+    [STAT_COUNT_ALIASES_DST]       = "copy destination aliases the shift count",
     [STAT_FORM_ODD]                = "unexpected operand form",
     [STAT_NO_DEF_IN_WINDOW]        = "no writer of needed register in window",
     [STAT_DEF_READ_BEFORE]         = "needed register read before candidate",
@@ -1974,11 +1976,19 @@ end:
 // state. Unlike the VEX table no legacy->new mapping is needed: the promoted
 // forms keep their iclass. IMUL is the two-operand 0F AF form; the immediate
 // IMULs (69/6B) already have a separate destination and never match the
-// candidate shape. NDD immediate forms exist only for the eight ALU entries,
-// which is also the only place the legacy shape can put one.
+// candidate shape. NEG/NOT/INC/DEC promote to two-operand NDD forms with no
+// second source (INC/DEC preserve CF exactly like their legacy encodings).
+// The shifts and rotates cover the imm8 and CL count forms; a by-one D1
+// pair decodes with an implicit immediate, re-encodes as the longer imm8
+// form, and falls to the length check. RCL/RCR have no promoted forms. NDD
+// immediate forms exist only for the ALU entries and the shifts, which is
+// also the only place the legacy shape can put one.
 static const xed_iclass_enum_t apx_ndd_rules[] = {
     XED_ICLASS_ADD, XED_ICLASS_ADC, XED_ICLASS_SUB, XED_ICLASS_SBB,
     XED_ICLASS_AND, XED_ICLASS_OR, XED_ICLASS_XOR, XED_ICLASS_IMUL,
+    XED_ICLASS_NEG, XED_ICLASS_NOT, XED_ICLASS_INC, XED_ICLASS_DEC,
+    XED_ICLASS_SHL, XED_ICLASS_SHR, XED_ICLASS_SAR,
+    XED_ICLASS_ROL, XED_ICLASS_ROR,
     XED_ICLASS_CMOVB, XED_ICLASS_CMOVBE, XED_ICLASS_CMOVL, XED_ICLASS_CMOVLE,
     XED_ICLASS_CMOVNB, XED_ICLASS_CMOVNBE, XED_ICLASS_CMOVNL,
     XED_ICLASS_CMOVNLE, XED_ICLASS_CMOVNO, XED_ICLASS_CMOVNP,
@@ -2000,6 +2010,14 @@ static bool apx_ndd_candidate_iclass(int iclass)
         return false;
     }
     return map[iclass];
+}
+
+// The unary entries promote to two-operand NDD forms: dst = OP(src), no
+// second source operand.
+static bool apx_ndd_unary(int iclass)
+{
+    return iclass == XED_ICLASS_NEG || iclass == XED_ICLASS_NOT ||
+           iclass == XED_ICLASS_INC || iclass == XED_ICLASS_DEC;
 }
 
 // Probe for an adjacent preceding register-to-register GPR MOV. Only plain
@@ -2049,16 +2067,17 @@ static const struct inst_history_entry *find_adjacent_gpr_mov(
 }
 
 // Encode the EVEX map 4 NDD form `iclass %rm, %src1, %dst` (Intel operand
-// order dst, src1, rm; dst lands in EVEX.vvvv). The encoder selects the
-// three-operand APX_F_N3 pattern from the operand signature alone, and a
-// zeroed request leaves NF=0, the flags-writing form. The encoding is new to
-// this pass, so re-decode the result and require the NDD attribute; a
-// surprising encoder outcome must never reach the binary. Shared by the
-// register path and the two-pass RIP-relative memory path.
+// order dst, src1, rm; dst lands in EVEX.vvvv). A NULL rm encodes the
+// two-operand unary form `iclass %src1, %dst`. The encoder selects the
+// APX_F_N3 pattern from the operand signature alone, and a zeroed request
+// leaves NF=0, the flags-writing form. The encoding is new to this pass, so
+// re-decode the result and require the NDD attribute; a surprising encoder
+// outcome must never reach the binary. Shared by the register path and the
+// two-pass RIP-relative memory path.
 static xed_error_enum_t apx_ndd_encode(xed_iclass_enum_t iclass,
                                        unsigned int eow,
                                        xed_reg_enum_t dst, xed_reg_enum_t src1,
-                                       xed_encoder_operand_t rm,
+                                       const xed_encoder_operand_t *rm,
                                        uint8_t *out, unsigned int *out_len)
 {
     xed_state_t state;
@@ -2066,8 +2085,13 @@ static xed_error_enum_t apx_ndd_encode(xed_iclass_enum_t iclass,
     state.mmode = XED_MACHINE_MODE_LONG_64;
     state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
     xed_encoder_instruction_t enc_inst;
-    xed_inst3(&enc_inst, state, iclass, eow,
-              xed_reg(dst), xed_reg(src1), rm);
+    if (rm != NULL) {
+        xed_inst3(&enc_inst, state, iclass, eow,
+                  xed_reg(dst), xed_reg(src1), *rm);
+    } else {
+        xed_inst2(&enc_inst, state, iclass, eow,
+                  xed_reg(dst), xed_reg(src1));
+    }
     xed_encoder_request_t req;
     xed_encoder_request_zero_set_mode(&req, &state);
     if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
@@ -2120,6 +2144,13 @@ int check_apx(uint8_t *inst, size_t len, bool replace)
 // exactly like the legacy op (ADC/SBB consume the same incoming CF, CMOVcc
 // tests the same condition), %a and %b hold the same values afterwards, and
 // %c receives the identical result.
+//
+// Unary NEG/NOT/INC/DEC fold the same way into two-operand NDD forms
+// (`mov %a,%c; neg %c` -> `neg %a,%c`), and the shift/rotate group folds
+// with its immediate or CL count carried over unchanged. A CL-count shift
+// whose destination is in the RCX family is refused: the legacy sequence
+// shifts by the count the copy itself just wrote, the fused form would
+// shift by the pre-copy count.
 //
 // Requiring the MOV to write exactly the register the op destroys (same
 // enum, hence same width) is what makes the fold sound: a 32-bit copy
@@ -2228,14 +2259,25 @@ static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
                 stat_reason = STAT_MEM_OR_IMM_OPERAND;
                 goto end;
             }
+            bool unary = apx_ndd_unary(iclass);
             if (!form_ok ||
-                (nmem == 0 && imm_bits == 0 && op_src == XED_REG_INVALID)) {
+                (unary ? (imm_bits != 0 || op_src != XED_REG_INVALID)
+                       : (nmem == 0 && imm_bits == 0 &&
+                          op_src == XED_REG_INVALID))) {
                 stat_reason = STAT_FORM_ODD;
                 goto end;
             }
             unsigned int eow = xed_get_register_width_bits(op_dst);
             if (eow != 32 && eow != 64) {
                 stat_reason = STAT_WIDTH_NOT_32_64;
+                goto end;
+            }
+            // Only the shifts can present an 8-bit register source at these
+            // widths: the CL count. See the header comment for why a
+            // destination in the RCX family must refuse.
+            if (op_src == XED_REG_CL &&
+                xed_get_largest_enclosing_register(op_dst) == XED_REG_RCX) {
+                stat_reason = STAT_COUNT_ALIASES_DST;
                 goto end;
             }
 
@@ -2291,7 +2333,7 @@ static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
                 // the promoted opcode.
                 op_rm = xed_imm0(xed_decoded_inst_get_unsigned_immediate(&xedd),
                                  imm_bits);
-            } else {
+            } else if (!unary) {
                 // If the op's source is also its destination, that source
                 // holds the copied value, so the rewrite must read the
                 // copy's source:
@@ -2304,7 +2346,8 @@ static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
 
             uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
             unsigned int new_len = 0;
-            if (apx_ndd_encode(iclass, eow, op_dst, copy_src, op_rm,
+            if (apx_ndd_encode(iclass, eow, op_dst, copy_src,
+                               unary ? NULL : &op_rm,
                                new_bytes, &new_len) != XED_ERROR_NONE) {
                 stat_reason = STAT_ENCODE_FAIL;
                 goto end;
@@ -2327,7 +2370,7 @@ static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
                         xed_disp(disp, 32),
                         xed_decoded_inst_get_memory_operand_length(&xedd, 0) * 8);
                 unsigned int len2 = 0;
-                if (apx_ndd_encode(iclass, eow, op_dst, copy_src, op_rm,
+                if (apx_ndd_encode(iclass, eow, op_dst, copy_src, &op_rm,
                                    new_bytes, &len2) != XED_ERROR_NONE ||
                     len2 != new_len) {
                     stat_reason = STAT_ENCODE_FAIL;
@@ -2352,7 +2395,8 @@ static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
                     xed_iclass_enum_t2str(iclass),
                     xed_reg_enum_t2str(op_dst), xed_reg_enum_t2str(copy_src),
                     nmem == 1 ? "mem" :
-                            imm_bits != 0 ? "imm" : xed_reg_enum_t2str(op_src),
+                            imm_bits != 0 ? "imm" :
+                            unary ? "-" : xed_reg_enum_t2str(op_src),
                     new_len, old_len);
             stat_reason = STAT_REWRITTEN;
             ++count;
