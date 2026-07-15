@@ -1866,5 +1866,112 @@ int main(int argc, char *argv[])
                           bytes, sizeof(bytes));
     }
 
+    /* ------ SETcc + MOVZX -> zero-upper SETcc. ------ */
+
+    /* setz %al; movzx %al,%eax == setzuz %al: the ZU form zeroes bits 63:8
+       exactly as the 32-bit MOVZX did. Both six bytes, an exact fit. */
+    {
+        uint8_t bytes[] = {
+            0x0F, 0x94, 0xC0,                    // setz %al
+            0x0F, 0xB6, 0xC0,                    // movzx %al,%eax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0x7F, 0x18, 0x44, 0xC0,  // setzuz %al
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Every condition code maps to its own promoted opcode. */
+    {
+        uint8_t bytes[] = {
+            0x0F, 0x92, 0xC0,                    // setb %al
+            0x0F, 0xB6, 0xC0,                    // movzx %al,%eax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0x7F, 0x18, 0x42, 0xC0,  // setzub %al
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* A 64-bit MOVZX zeroes the same bits; its REX.W byte becomes a NOP. */
+    {
+        uint8_t bytes[] = {
+            0x0F, 0x94, 0xC0,                    // setz %al
+            0x48, 0x0F, 0xB6, 0xC0,              // movzx %al,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0x7F, 0x18, 0x44, 0xC0,  // setzuz %al
+            0x90,                                // 1-byte NOP
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Extended byte registers work; the two REX prefixes leave two NOP
+       bytes. */
+    {
+        uint8_t bytes[] = {
+            0x41, 0x0F, 0x97, 0xC0,              // setnbe %r8b
+            0x45, 0x0F, 0xB6, 0xC0,              // movzx %r8b,%r8d
+        };
+        const uint8_t expect[] = {
+            0x62, 0xD4, 0x7F, 0x18, 0x47, 0xC0,  // setzunbe %r8b
+            0x66, 0x90,                          // 2-byte NOP
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* MOVZX into a different register family is not a candidate. */
+    CHECK_APX(
+        0,
+        0x0F, 0x94, 0xC0,        // setz %al
+        0x0F, 0xB6, 0xD0,        // movzx %al,%edx
+        0xC3
+    );
+
+    /* Soundness: a 16-bit MOVZX preserves bits 63:16 that ZU zeroes. */
+    CHECK_APX(
+        0,
+        0x0F, 0x94, 0xC0,        // setz %al
+        0x66, 0x0F, 0xB6, 0xC0,  // movzx %al,%ax
+        0xC3
+    );
+
+    /* Soundness: high-byte registers cannot be EVEX-encoded. */
+    CHECK_APX(
+        0,
+        0x0F, 0x94, 0xC4,        // setz %ah
+        0x0F, 0xB6, 0xC4,        // movzx %ah,%eax
+        0xC3
+    );
+
+    /* The pair must be byte-adjacent. */
+    CHECK_APX(
+        0,
+        0x0F, 0x94, 0xC0,        // setz %al
+        0x90,                    // nop
+        0x0F, 0xB6, 0xC0,        // movzx %al,%eax
+        0xC3
+    );
+
+    /* A memory-destination SETcc writes no register... */
+    CHECK_APX(
+        0,
+        0x0F, 0x94, 0x07,        // setz (%rdi)
+        0x0F, 0xB6, 0xC0,        // movzx %al,%eax
+        0xC3
+    );
+
+    /* ...and a memory-source MOVZX reads no SETcc result. */
+    CHECK_APX(
+        0,
+        0x0F, 0x94, 0xC0,        // setz %al
+        0x0F, 0xB6, 0x07,        // movzx (%rdi),%eax
+        0xC3
+    );
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

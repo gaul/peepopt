@@ -2034,6 +2034,24 @@ static bool apx_ndd_commutative(int iclass)
            iclass == XED_ICLASS_XOR || iclass == XED_ICLASS_IMUL;
 }
 
+// The sixteen SETcc anchors for the zero-upper fuse.
+static bool apx_setcc(int iclass)
+{
+    switch (iclass) {
+    case XED_ICLASS_SETB:   case XED_ICLASS_SETBE:
+    case XED_ICLASS_SETL:   case XED_ICLASS_SETLE:
+    case XED_ICLASS_SETNB:  case XED_ICLASS_SETNBE:
+    case XED_ICLASS_SETNL:  case XED_ICLASS_SETNLE:
+    case XED_ICLASS_SETNO:  case XED_ICLASS_SETNP:
+    case XED_ICLASS_SETNS:  case XED_ICLASS_SETNZ:
+    case XED_ICLASS_SETO:   case XED_ICLASS_SETP:
+    case XED_ICLASS_SETS:   case XED_ICLASS_SETZ:
+        return true;
+    default:
+        return false;
+    }
+}
+
 // The CMOVcc with the opposite condition, or XED_ICLASS_INVALID for
 // non-CMOV anchors. `mov (m),%c; cmovcc %b,%c` selects %b when the
 // condition holds and the loaded value otherwise; the NDD form selects its
@@ -2175,6 +2193,51 @@ static xed_error_enum_t apx_ndd_encode(xed_iclass_enum_t iclass,
     return XED_ERROR_NONE;
 }
 
+// Encode the promoted zero-upper SETcc `setzucc %dst` (EVEX map 4, ND=1),
+// which writes cc ? 1 : 0 to the byte register and zeroes bits 63:8. xed's
+// generated encoder cannot select this form: the plain promoted form's
+// condition row is identical, so it always wins. Encode the plain form by
+// requiring EVEX, set the one differing bit (EVEX.ND) by hand, and
+// re-decode demanding the zero-upper shape; a surprising outcome must never
+// reach the binary.
+static xed_error_enum_t apx_setzu_encode(xed_iclass_enum_t iclass,
+                                         xed_reg_enum_t dst,
+                                         uint8_t *out, unsigned int *out_len)
+{
+    xed_state_t state;
+    xed_state_zero(&state);
+    state.mmode = XED_MACHINE_MODE_LONG_64;
+    state.stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    xed_encoder_instruction_t enc_inst;
+    xed_inst1(&enc_inst, state, iclass, 8, xed_reg(dst));
+    xed_encoder_request_t req;
+    xed_encoder_request_zero_set_mode(&req, &state);
+    if (!xed_convert_to_encoder_request(&req, &enc_inst)) {
+        return XED_ERROR_GENERAL_ERROR;
+    }
+    xed3_operand_set_must_use_evex(&req, 1);
+    xed_error_enum_t err = xed_encode(&req, out, XED_MAX_INSTRUCTION_BYTES,
+                                      out_len);
+    if (err != XED_ERROR_NONE) {
+        return err;
+    }
+    if (*out_len < 4 || out[0] != 0x62) {
+        return XED_ERROR_GENERAL_ERROR;
+    }
+    out[3] |= 0x10;  // EVEX.ND selects the zero-upper variant
+    xed_decoded_inst_t chk;
+    xed_decoded_inst_zero(&chk);
+    xed_decoded_inst_set_mode(&chk, XED_MACHINE_MODE_LONG_64,
+                              XED_ADDRESS_WIDTH_64b);
+    if (xed_decode(&chk, out, *out_len) != XED_ERROR_NONE ||
+        (int)xed_decoded_inst_get_iclass(&chk) != (int)iclass ||
+        xed3_operand_get_nd(&chk) != 1 ||
+        xed_decoded_inst_get_reg(&chk, XED_OPERAND_REG0) != dst) {
+        return XED_ERROR_GENERAL_ERROR;
+    }
+    return XED_ERROR_NONE;
+}
+
 static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
                           const uint8_t *branch_targets);
 
@@ -2266,6 +2329,86 @@ static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
         }
 
         int iclass = xed_decoded_inst_get_iclass(&xedd);
+
+        // SETcc + MOVZX of its result back into its own register family
+        // fuses into the promoted zero-upper SETcc, which writes cc ? 1 : 0
+        // and zeroes bits 63:8 exactly as the 32/64-bit MOVZX did:
+        //   setb %al; movzx %al,%eax  ->  setzub %al
+        // Neither instruction writes flags and the condition is read at the
+        // same point. High-byte sources cannot be EVEX-encoded and a 16-bit
+        // MOVZX destination preserves bits 63:16 that ZU zeroes, so both
+        // refuse. The rewrite consumes the MOVZX; a MOVZX following an
+        // already-fused SETcc merely fuses again to the same instruction.
+        if (iclass == XED_ICLASS_MOVZX) {
+            if (xed_decoded_inst_number_of_memory_operands(&xedd) != 0) {
+                goto end;
+            }
+            xed_reg_enum_t mz_dst =
+                    xed_decoded_inst_get_reg(&xedd, XED_OPERAND_REG0);
+            xed_reg_enum_t mz_src =
+                    xed_decoded_inst_get_reg(&xedd, XED_OPERAND_REG1);
+            if (xed_reg_class(mz_src) != XED_REG_CLASS_GPR ||
+                xed_get_register_width_bits(mz_src) != 8 ||
+                xed_get_largest_enclosing_register(mz_dst) !=
+                xed_get_largest_enclosing_register(mz_src)) {
+                goto end;
+            }
+            const struct inst_history_entry *e = history_at(&history, 1);
+            if (e == NULL ||
+                e->offset + xed_decoded_inst_get_length(&e->xedd) != offset ||
+                !apx_setcc(xed_decoded_inst_get_iclass(&e->xedd)) ||
+                xed_decoded_inst_number_of_memory_operands(&e->xedd) != 0 ||
+                xed_decoded_inst_get_reg(&e->xedd, XED_OPERAND_REG0) !=
+                        mz_src) {
+                goto end;
+            }
+            stat_candidate("apx", XED_ICLASS_MOVZX);
+            xed_iclass_enum_t cc = xed_decoded_inst_get_iclass(&e->xedd);
+            unsigned int dst_width = xed_get_register_width_bits(mz_dst);
+            if (dst_width != 32 && dst_width != 64) {
+                stat_reason = STAT_WIDTH_NOT_32_64;
+                goto end;
+            }
+            if (mz_src == XED_REG_AH || mz_src == XED_REG_BH ||
+                mz_src == XED_REG_CH || mz_src == XED_REG_DH) {
+                stat_reason = STAT_SRC_HIGH_BYTE;
+                goto end;
+            }
+            uint8_t new_bytes[XED_MAX_INSTRUCTION_BYTES];
+            unsigned int new_len = 0;
+            if (apx_setzu_encode(cc, mz_src, new_bytes,
+                                 &new_len) != XED_ERROR_NONE) {
+                stat_reason = STAT_ENCODE_FAIL;
+                goto end;
+            }
+            size_t rewrite_end = offset + xed_decoded_inst_get_length(&xedd);
+            unsigned int old_len = rewrite_end - e->offset;
+            if (new_len > old_len) {
+                stat_reason = STAT_TOO_LONG;
+                goto end;
+            }
+            if (target_in_interior(branch_targets, e->offset, rewrite_end)) {
+                stat_reason = STAT_BRANCH_TARGET_INTERIOR;
+                goto end;
+            }
+            printf("R apx %s %s, ZU [%u bytes, replacing %u]\n",
+                   xed_iclass_enum_t2str(cc), xed_reg_enum_t2str(mz_src),
+                   new_len, old_len);
+            stat_reason = STAT_REWRITTEN;
+            ++count;
+            if (replace) {
+                uint8_t *addr = inst + e->offset;
+                memcpy(addr, new_bytes, new_len);
+                if (old_len > new_len) {
+                    if (xed_encode_nop(addr + new_len,
+                                       old_len - new_len) != XED_ERROR_NONE) {
+                        return -1;
+                    }
+                }
+            }
+            goto end;
+        }
+
         if (!apx_ndd_candidate_iclass(iclass)) {
             goto end;
         }

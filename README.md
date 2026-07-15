@@ -146,6 +146,20 @@ Immediate, unary, and shift ops keep the loaded value as the first operand inste
 Because the address is computed inside the fused instruction, it may even read the destination (`mov (%rax),%rax; add %rsi,%rax` is fine) — the stale-address refusal only applies in the other direction.
 The 64-bit register pair and the EVEX form are both six bytes, an exact fit; REX-less 32-bit pairs are two bytes too short and stay legacy.
 
+A related fuse rewrites Boolean materialization: `setcc %al; movzx %al,%eax` becomes the promoted zero-upper SETcc, which writes the condition byte and zeroes bits 63:8 exactly as the 32- or 64-bit MOVZX did:
+
+```
+0F94C0         setz %al
+0FB6C0         movzx %al,%eax
+```
+
+```
+62F47F1844C0   setzuz %al
+```
+
+The shortest legacy pair and the EVEX form are both six bytes, so every site fits.
+High-byte sources (`%ah`) cannot be EVEX-encoded and a 16-bit MOVZX destination preserves upper bits that ZU zeroes, so both are refused.
+
 Because APX requires very new processors (Panther Lake / Diamond Rapids and later), this family is opt-in via `-m apx` and is validated under the [Intel Software Development Emulator](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html): `make test-apx` rewrites an assembly fixture, diffs its output under `sde64 -dmr` against a native baseline, and checks SDE's instruction-mix histogram to prove NDD instructions actually executed.
 
 ## Optimizing existing binaries
@@ -208,7 +222,7 @@ XED_PATH=/path/to/xed SDE_PATH=/path/to/sde make test-apx
 ## Future directions
 
 * [10-15 byte no-ops](https://reviews.llvm.org/D75945) - optimal on Sandy Bridge and newer only but Atom and Zen perform poorly
-* more [APX](https://en.wikipedia.org/wiki/X86#APX) - `setcc %al; movzx %al,%eax` → the zero-upper SETcc form (1,477 sites in libxul.so, every one byte-fitting, but XED v2025.12.14 cannot encode it), no-flag (NF) variants, and extended GPRs (R16-R31)
+* more [APX](https://en.wikipedia.org/wiki/X86#APX) - no-flag (NF) variants and extended GPRs (R16-R31)
   - measured dead ends: CFCMOV/CCMP branch elimination (a rel8 `jcc` plus the guarded op is always one byte short of the EVEX form), PUSH2/POP2 (never fits), JMPABS (needs link-time-unknown GOT values)
 * [BMI](https://en.wikipedia.org/wiki/X86_Bit_manipulation_instruction_set) - more flexible bit manipulations
 * FSRM - improve memory copies on Ice Lake and newer processors

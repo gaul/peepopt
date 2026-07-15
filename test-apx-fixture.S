@@ -204,4 +204,22 @@ apx_load_selfptr:
     add %rsi, %rax
     ret
 
+    // SETcc+MOVZX fuses into the promoted zero-upper SETcc.
+    .globl apx_setzu
+    .type apx_setzu, @function
+apx_setzu:
+    cmp %rsi, %rdi
+    setb %al
+    movzx %al, %eax
+    ret
+
+    .globl apx_setzu_ext
+    .type apx_setzu_ext, @function
+apx_setzu_ext:
+    cmp %rsi, %rdi
+    setnbe %r8b
+    movzx %r8b, %r8d
+    mov %r8d, %eax
+    ret
+
     .section .note.GNU-stack,"",@progbits

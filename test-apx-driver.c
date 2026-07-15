@@ -46,6 +46,8 @@ uint64_t apx_load_neg(const uint64_t *p);
 uint64_t apx_load_shl(const uint64_t *p);
 uint64_t apx_load_cmov(const uint64_t *p, uint64_t a, uint64_t b, uint64_t c);
 uint64_t apx_load_selfptr(const uint64_t *p, uint64_t y);
+uint64_t apx_setzu(uint64_t x, uint64_t y);
+uint64_t apx_setzu_ext(uint64_t x, uint64_t y);
 
 int main(void)
 {
@@ -87,6 +89,8 @@ int main(void)
             printf("load_cmov=%" PRIx64 "\n",
                    apx_load_cmov(&mem, x, y, x ^ y));
             printf("load_selfptr=%" PRIx64 "\n", apx_load_selfptr(&mem, x));
+            printf("setzu=%" PRIx64 "\n", apx_setzu(x, y));
+            printf("setzu_ext=%" PRIx64 "\n", apx_setzu_ext(x, y));
         }
     }
     return 0;
