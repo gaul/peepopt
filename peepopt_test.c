@@ -1653,5 +1653,218 @@ int main(int argc, char *argv[])
                           bytes, sizeof(bytes));
     }
 
+    /* ------ Load-copy folds: the memory source moves into the op. ------ */
+
+    /* mov (%rdi),%rax; add %rsi,%rax == rax = [rdi] + rsi ==
+       add (%rdi),%rsi,%rax by commutativity; both six bytes. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                    // mov (%rdi),%rax
+            0x48, 0x01, 0xF0,                    // add %rsi,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x03, 0x37,  // add (%rdi),%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* XOR commutes the same way. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                    // mov (%rdi),%rax
+            0x48, 0x31, 0xF0,                    // xor %rsi,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x33, 0x37,  // xor (%rdi),%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* IMUL commutes; the 0F-map legacy pair leaves a NOP byte. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                    // mov (%rdi),%rax
+            0x48, 0x0F, 0xAF, 0xC6,              // imul %rsi,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xAF, 0x37,  // imul (%rdi),%rsi,%rax
+            0x90,                                // 1-byte NOP
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Soundness: SUB with a register source would compute rsi - [rdi]
+       instead of [rdi] - rsi. */
+    CHECK_APX(
+        0,
+        0x48, 0x8B, 0x07,        // mov (%rdi),%rax
+        0x48, 0x29, 0xF0,        // sub %rsi,%rax
+        0xC3
+    );
+
+    /* But SUB with an immediate keeps the loaded value first: rax =
+       [rdi] - 100. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                          // mov (%rdi),%rax
+            0x48, 0x83, 0xE8, 0x64,                    // sub $100,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x83, 0x2F, 0x64,  // sub $100,(%rdi),%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* The ten-byte imm32 form also fits exactly. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                    // mov (%rdi),%rax
+            0x48, 0x81, 0xE8,                    // sub $0x11223344,%rax
+            0x44, 0x33, 0x22, 0x11,
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x81, 0x2F,  // sub $0x11223344,(%rdi),%rax
+            0x44, 0x33, 0x22, 0x11,
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Unary over a loaded value, with a displacement riding along. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x47, 0x08,                    // mov 0x8(%rdi),%rax
+            0x48, 0xF7, 0xD8,                          // neg %rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xF7, 0x5F, 0x08,  // neg 0x8(%rdi),%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Shift of a loaded value by an immediate. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                          // mov (%rdi),%rax
+            0x48, 0xC1, 0xE0, 0x05,                    // shl $5,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xC1, 0x27, 0x05,  // shl $5,(%rdi),%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* ...and by CL. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                    // mov (%rdi),%rax
+            0x48, 0xD3, 0xE8,                    // shr %cl,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0xD3, 0x2F,  // shr %cl,(%rdi),%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* CMOVcc folds with its condition inverted: rax = zf ? rsi : [rdi]
+       becomes cmovnz (%rdi),%rsi,%rax. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x07,                    // mov (%rdi),%rax
+            0x48, 0x0F, 0x44, 0xC6,              // cmovz %rsi,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x45, 0x37,  // cmovnz (%rdi),%rsi,%rax
+            0x90,                                // 1-byte NOP
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* The address may read the destination: both sequences compute it
+       before the write. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x00,                    // mov (%rax),%rax
+            0x48, 0x01, 0xF0,                    // add %rsi,%rax
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x03, 0x30,  // add (%rax),%rsi,%rax
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* Soundness: the op's source must not read the loaded destination; the
+       loaded value exists in no register to substitute. */
+    CHECK_APX(
+        0,
+        0x48, 0x8B, 0x07,        // mov (%rdi),%rax
+        0x48, 0x01, 0xC0,        // add %rax,%rax
+        0xC3
+    );
+
+    /* A widening load is no plain copy. */
+    CHECK_APX(
+        0,
+        0x48, 0x0F, 0xB6, 0x07,  // movzbq (%rdi),%rax
+        0x48, 0x01, 0xF0,        // add %rsi,%rax
+        0xC3
+    );
+
+    /* A store writes no GPR. */
+    CHECK_APX(
+        0,
+        0x48, 0x89, 0x07,        // mov %rax,(%rdi)
+        0x48, 0x01, 0xF0,        // add %rsi,%rax
+        0xC3
+    );
+
+    /* The REX-less 32-bit load pair is four bytes, too short... */
+    CHECK_APX(
+        0,
+        0x8B, 0x07,              // mov (%rdi),%eax
+        0x01, 0xF0,              // add %esi,%eax
+        0xC3
+    );
+
+    /* ...but extended registers make it six and it fits. */
+    {
+        uint8_t bytes[] = {
+            0x44, 0x8B, 0x0F,                    // mov (%rdi),%r9d
+            0x45, 0x21, 0xC1,                    // and %r8d,%r9d
+        };
+        const uint8_t expect[] = {
+            0x62, 0x74, 0x34, 0x18, 0x23, 0x07,  // and (%rdi),%r8d,%r9d
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
+    /* RIP-relative load: original target = 7 + 0x20 = 0x27; the ten-byte
+       EVEX form starts at offset 0, so the displacement becomes 0x1D. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x8B, 0x05,                    // mov 0x20(%rip),%rax
+            0x20, 0x00, 0x00, 0x00,
+            0x48, 0x01, 0xF0,                    // add %rsi,%rax
+            0xC3,
+        };
+        const uint8_t expect[] = {
+            0x62, 0xF4, 0xFC, 0x18, 0x03, 0x35,  // add 0x1d(%rip),%rsi,%rax
+            0x1D, 0x00, 0x00, 0x00,
+            0xC3,
+        };
+        check_apx_replace(__LINE__, 1, expect, sizeof(expect),
+                          bytes, sizeof(bytes));
+    }
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

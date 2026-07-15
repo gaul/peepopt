@@ -40,6 +40,12 @@ uint64_t apx_inc64(uint64_t x, uint64_t y);
 uint64_t apx_shl_imm(uint64_t x);
 uint64_t apx_rol_imm(uint64_t x);
 uint64_t apx_shr_cl(uint64_t x, uint64_t u1, uint64_t u2, uint64_t count);
+uint64_t apx_load_add(const uint64_t *p, uint64_t y);
+uint64_t apx_load_sub_imm(const uint64_t *p);
+uint64_t apx_load_neg(const uint64_t *p);
+uint64_t apx_load_shl(const uint64_t *p);
+uint64_t apx_load_cmov(const uint64_t *p, uint64_t a, uint64_t b, uint64_t c);
+uint64_t apx_load_selfptr(const uint64_t *p, uint64_t y);
 
 int main(void)
 {
@@ -74,6 +80,13 @@ int main(void)
             printf("shl_imm=%" PRIx64 "\n", apx_shl_imm(x));
             printf("rol_imm=%" PRIx64 "\n", apx_rol_imm(x));
             printf("shr_cl=%" PRIx64 "\n", apx_shr_cl(x, 0, 0, y));
+            printf("load_add=%" PRIx64 "\n", apx_load_add(&mem, x));
+            printf("load_sub_imm=%" PRIx64 "\n", apx_load_sub_imm(&mem));
+            printf("load_neg=%" PRIx64 "\n", apx_load_neg(&mem));
+            printf("load_shl=%" PRIx64 "\n", apx_load_shl(&mem));
+            printf("load_cmov=%" PRIx64 "\n",
+                   apx_load_cmov(&mem, x, y, x ^ y));
+            printf("load_selfptr=%" PRIx64 "\n", apx_load_selfptr(&mem, x));
         }
     }
     return 0;

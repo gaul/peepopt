@@ -154,4 +154,54 @@ apx_shr_cl:
     shr %cl, %rax
     ret
 
+    // Load-copy folds: the memory source moves into the NDD r/m slot.
+    .globl apx_load_add
+    .type apx_load_add, @function
+apx_load_add:
+    mov (%rdi), %rax
+    add %rsi, %rax
+    ret
+
+    // A non-commutative op folds only with the loaded value kept first.
+    .globl apx_load_sub_imm
+    .type apx_load_sub_imm, @function
+apx_load_sub_imm:
+    mov (%rdi), %rax
+    sub $100, %rax
+    ret
+
+    .globl apx_load_neg
+    .type apx_load_neg, @function
+apx_load_neg:
+    mov (%rdi), %rax
+    neg %rax
+    ret
+
+    .globl apx_load_shl
+    .type apx_load_shl, @function
+apx_load_shl:
+    mov (%rdi), %rax
+    shl $5, %rax
+    ret
+
+    // The condition inverts when the load folds into a CMOV:
+    // rax = (rsi < rdx) ? rcx : (%rdi).
+    .globl apx_load_cmov
+    .type apx_load_cmov, @function
+apx_load_cmov:
+    cmp %rdx, %rsi
+    mov (%rdi), %rax
+    cmovb %rcx, %rax
+    ret
+
+    // The load address may read the destination: both forms compute the
+    // address before the write.
+    .globl apx_load_selfptr
+    .type apx_load_selfptr, @function
+apx_load_selfptr:
+    mov %rdi, %rax
+    mov (%rax), %rax
+    add %rsi, %rax
+    ret
+
     .section .note.GNU-stack,"",@progbits

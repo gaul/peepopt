@@ -129,6 +129,21 @@ A `%cl`-count shift whose destination is in the RCX family is refused: the legac
 Like the VEX rewrite this needs no forward analysis: the promoted forms with `NF=0` read and write `EFLAGS` exactly like their legacy encodings (ADC/SBB consume the same incoming carry), every source register keeps its value, and the destination receives the identical result.
 The MOV must write exactly the register the op destroys: a narrower copy feeding a wider op relies on the MOV's zero extension, and 8/16-bit ops are excluded because their promoted forms zero the rest of the destination.
 A memory address that reads the copy's destination would compute from a stale value once the MOV is folded away, so those sites are refused.
+
+A memory-*source* copy folds symmetrically, moving the load into the fused instruction (`mov (%rdi),%rax; add %rsi,%rax` → `add (%rdi),%rsi,%rax`):
+
+```
+488B07         mov (%rdi),%rax
+4801F0         add %rsi,%rax
+```
+
+```
+62F4FC180337   add (%rdi),%rsi,%rax
+```
+
+With a register second source the r/m slot is taken, so the op must be commutative — SUB and SBB are refused — or a CMOVcc, which folds with its condition inverted (both the legacy pair and the promoted CMOVcc access memory whatever the condition).
+Immediate, unary, and shift ops keep the loaded value as the first operand instead, so all of them fold, SUB and SBB included.
+Because the address is computed inside the fused instruction, it may even read the destination (`mov (%rax),%rax; add %rsi,%rax` is fine) — the stale-address refusal only applies in the other direction.
 The 64-bit register pair and the EVEX form are both six bytes, an exact fit; REX-less 32-bit pairs are two bytes too short and stay legacy.
 
 Because APX requires very new processors (Panther Lake / Diamond Rapids and later), this family is opt-in via `-m apx` and is validated under the [Intel Software Development Emulator](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html): `make test-apx` rewrites an assembly fixture, diffs its output under `sde64 -dmr` against a native baseline, and checks SDE's instruction-mix histogram to prove NDD instructions actually executed.
@@ -193,7 +208,8 @@ XED_PATH=/path/to/xed SDE_PATH=/path/to/sde make test-apx
 ## Future directions
 
 * [10-15 byte no-ops](https://reviews.llvm.org/D75945) - optimal on Sandy Bridge and newer only but Atom and Zen perform poorly
-* more [APX](https://en.wikipedia.org/wiki/X86#APX) - NDD forms of NEG/NOT/INC/DEC and shift-by-immediate, no-flag (NF) variants, and extended GPRs (R16-R31)
+* more [APX](https://en.wikipedia.org/wiki/X86#APX) - `setcc %al; movzx %al,%eax` → the zero-upper SETcc form (1,477 sites in libxul.so, every one byte-fitting, but XED v2025.12.14 cannot encode it), no-flag (NF) variants, and extended GPRs (R16-R31)
+  - measured dead ends: CFCMOV/CCMP branch elimination (a rel8 `jcc` plus the guarded op is always one byte short of the EVEX form), PUSH2/POP2 (never fits), JMPABS (needs link-time-unknown GOT values)
 * [BMI](https://en.wikipedia.org/wiki/X86_Bit_manipulation_instruction_set) - more flexible bit manipulations
 * FSRM - improve memory copies on Ice Lake and newer processors
   - difficult replacement due more complicated register usage

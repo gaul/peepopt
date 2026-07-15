@@ -15,9 +15,9 @@ cp test-apx-fixture test-apx-fixture.opt
 ./peepopt -m apx test-apx-fixture.opt > apx-peepopt.log
 count=$(grep -c '^R apx ' apx-peepopt.log)
 echo "R apx rewrites: $count"
-# The 17 fixture bodies contribute 16 (the REX-less 32-bit pair must stay);
+# The 23 fixture bodies contribute 22 (the REX-less 32-bit pair must stay);
 # crt/driver code may legitimately add more.
-test "$count" -ge 16
+test "$count" -ge 22
 
 "$SDE_PATH/sde64" $SDE_CHIP -- ./test-apx-fixture.opt > apx-rewritten.out
 diff apx-baseline.out apx-rewritten.out
