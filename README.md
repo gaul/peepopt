@@ -218,7 +218,9 @@ XED_PATH=/path/to/xed SDE_PATH=/path/to/sde make test-awk
 * `peepopt --dry-run program_file`
   - Show which replacements peepopt would do
 * `peepopt [--verbose] program_file`
-  - Optimize the input binary with replacement instructions
+  - Optimize the input binary with replacement instructions; the rewrite
+    happens on a temporary copy that atomically replaces the input only on
+    success, so failures and crashes leave the original untouched
 * `peepopt --dry-run --stats program_file`
   - Also print a histogram of why each candidate site was or was not rewritten
 * `peepopt -m apx program_file`

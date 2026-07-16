@@ -1,8 +1,13 @@
 # Limitations
 
-peepopt performs equal-size in-place rewrites without relocating code.
+peepopt performs equal-size rewrites without relocating code.
 That keeps it simple and avoids disturbing PC-relative addressing, but it also
-bounds what it can safely touch.
+bounds what it can safely touch. The rewrites happen on a temporary copy that
+atomically replaces the target only after every pass and the boundary
+verifier succeed, so a failure or crash leaves the original untouched (at
+worst a stray `<file>.peepopt.*` temporary remains after a hard kill). The
+replace swaps the inode: hard links to the original keep the old content,
+and the target of a symlink — not the symlink itself — is replaced.
 
 * **Indirect branches are covered only when their targets are recoverable.**
   The pre-scan protects, in addition to PC-relative direct branches: `switch`

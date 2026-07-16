@@ -553,9 +553,87 @@ out:
 static void usage(const char *program)
 {
     fprintf(stderr,
-            "peepopt optimizes x86-64 binaries, rewriting them in-place\n" \
+            "peepopt optimizes x86-64 binaries, atomically replacing them on success\n" \
             "usage: %s [--dry-run] [--stats] [--verbose] [-m|--march apx] <ELF_FILE>\n", program);
     exit(EXIT_FAILURE);
+}
+
+// Crash safety: rewrites happen on a temporary copy that replaces the
+// target via rename() only after every pass and the boundary verifier
+// succeed. Every error path exits through atexit, which discards the copy
+// and leaves the original untouched.
+static char g_tmp_path[PATH_MAX];
+
+static void cleanup_tmp(void)
+{
+    if (g_tmp_path[0] != '\0') {
+        unlink(g_tmp_path);
+    }
+}
+
+// Copy the target into a mkstemp file in the same directory (so rename()
+// stays on one filesystem), preserving permissions. Returns the writable
+// fd with g_tmp_path filled in, or -1 with a message printed.
+static int make_tmp_copy(const char *path)
+{
+    int src = open(path, O_RDONLY);
+    if (src == -1) {
+        perror("Error opening file");
+        return -1;
+    }
+    struct stat src_st;
+    if (fstat(src, &src_st) != 0 || !S_ISREG(src_st.st_mode)) {
+        fprintf(stderr, "not a regular file: %s\n", path);
+        close(src);
+        return -1;
+    }
+    int written = snprintf(g_tmp_path, sizeof(g_tmp_path),
+                           "%s.peepopt.XXXXXX", path);
+    if (written < 0 || (size_t)written >= sizeof(g_tmp_path)) {
+        fprintf(stderr, "path too long: %s\n", path);
+        close(src);
+        return -1;
+    }
+    int fd = mkstemp(g_tmp_path);
+    if (fd == -1) {
+        perror("Error creating temporary copy");
+        g_tmp_path[0] = '\0';
+        close(src);
+        return -1;
+    }
+    atexit(cleanup_tmp);
+    if (fchmod(fd, src_st.st_mode & 07777) != 0) {
+        perror("Error preserving permissions");
+        close(fd);
+        close(src);
+        return -1;
+    }
+    // Best effort: only relevant (and only permitted) when running as root.
+    (void)!fchown(fd, src_st.st_uid, src_st.st_gid);
+
+    char buf[1 << 16];
+    ssize_t got;
+    while ((got = read(src, buf, sizeof(buf))) > 0) {
+        ssize_t done = 0;
+        while (done < got) {
+            ssize_t put = write(fd, buf + done, (size_t)(got - done));
+            if (put < 0) {
+                perror("Error copying file");
+                close(fd);
+                close(src);
+                return -1;
+            }
+            done += put;
+        }
+    }
+    if (got < 0) {
+        perror("Error copying file");
+        close(fd);
+        close(src);
+        return -1;
+    }
+    close(src);
+    return fd;
 }
 
 int main(int argc, char **argv)
@@ -610,10 +688,26 @@ int main(int argc, char **argv)
 
     peepopt_set_verbose(verbose);
 
-    int fd = open(argv[optind], dry_run ? O_RDONLY : O_RDWR);
-    if (fd == -1) {
-        perror("Error opening file");
+    // Resolve symlinks (e.g. /bin/awk -> gawk) so the atomic replace swaps
+    // the real file rather than turning the symlink into a regular file.
+    static char resolved_path[PATH_MAX];
+    if (realpath(argv[optind], resolved_path) == NULL) {
+        perror("Error resolving path");
         exit(1);
+    }
+
+    int fd;
+    if (dry_run) {
+        fd = open(resolved_path, O_RDONLY);
+        if (fd == -1) {
+            perror("Error opening file");
+            exit(1);
+        }
+    } else {
+        fd = make_tmp_copy(resolved_path);
+        if (fd == -1) {
+            exit(1);
+        }
     }
 
     xed_tables_init();
@@ -988,10 +1082,27 @@ int main(int argc, char **argv)
     if (stats) {
         peepopt_print_stats();
     }
-    printf("%d rewrites\n", rewrites);
 
     munmap(addr, file_size);
-    close(fd);
+    if (!dry_run) {
+        // Durability, then atomicity: flush the rewritten copy to disk and
+        // swap it in; a crash at any earlier point leaves the target as it
+        // was.
+        if (fsync(fd) != 0) {
+            perror("Error syncing rewritten copy");
+            close(fd);
+            return 1;
+        }
+        close(fd);
+        if (rename(g_tmp_path, resolved_path) != 0) {
+            perror("Error replacing file");
+            return 1;
+        }
+        g_tmp_path[0] = '\0';
+    } else {
+        close(fd);
+    }
+    printf("%d rewrites\n", rewrites);
     return 0;
 }
 
