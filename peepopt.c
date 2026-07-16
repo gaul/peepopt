@@ -666,40 +666,248 @@ static void repack_gap(uint8_t *inst, const struct inst_history *h,
 static int check_shifts_impl(uint8_t *inst, size_t len, bool replace,
                               const uint8_t *branch_targets);
 
+// Mark a virtual address as a branch target if it falls inside the section.
+// Returns true if a bit was set.
+static bool mark_target_va(uint8_t *targets, size_t len, uint64_t text_vaddr,
+                           uint64_t va)
+{
+    if (va < text_vaddr || va - text_vaddr >= len) {
+        return false;
+    }
+    size_t t = (size_t)(va - text_vaddr);
+    targets[t / 8] |= (uint8_t)(1u << (t % 8));
+    return true;
+}
+
+// Find the read-only data section containing `va`, or NULL.
+static const struct peepopt_data_section *find_data_section(
+        const struct peepopt_ctx *ctx, uint64_t va)
+{
+    for (size_t i = 0; i < ctx->num_data_sections; i++) {
+        const struct peepopt_data_section *ds = &ctx->data_sections[i];
+        if (va >= ds->vaddr && va - ds->vaddr < ds->size) {
+            return ds;
+        }
+    }
+    return NULL;
+}
+
+// A candidate jump-table base discovered in the section: the target of a
+// RIP-relative LEA into a data section (int32-relative entries, the PIC
+// switch lowering) or the absolute displacement of a memory-indirect JMP
+// (8-byte pointer entries, the non-PIC lowering).
+struct table_base {
+    uint64_t va;
+    bool abs64;
+};
+
+static int table_base_cmp(const void *a, const void *b)
+{
+    const struct table_base *x = a;
+    const struct table_base *y = b;
+    if (x->va != y->va) {
+        return x->va < y->va ? -1 : 1;
+    }
+    return (int)x->abs64 - (int)y->abs64;
+}
+
+// Treat `base_va` (inside `ds`) as a candidate int32-relative jump table: the
+// clang/gcc PIC switch lowering loads a 4-byte entry and adds the table base
+// (lea table(%rip),%rA; movslq (%rA,%rB,4),%rC; add %rA,%rC; jmp *%rC).
+// Mark every entry whose base-relative target lands in the section. The walk
+// ends at `end_off` (the next candidate table base — compilers pack tables
+// back to back, and a later table's entries are meaningless relative to this
+// base) or at the first entry whose target leaves the section, since real
+// tables are contiguous and point exclusively into .text. Non-table LEAs
+// (e.g. string constants) over-mark a few bytes at most, which only
+// suppresses rewrites — never unsafe. Returns the number of entries marked.
+static size_t walk_rel32_table(const struct peepopt_data_section *ds,
+                               uint64_t base_va, size_t end_off,
+                               uint64_t text_vaddr, size_t text_len,
+                               uint8_t *targets)
+{
+    size_t marked = 0;
+    for (size_t off = (size_t)(base_va - ds->vaddr); off + 4 <= end_off;
+         off += 4) {
+        int32_t entry;
+        memcpy(&entry, ds->bytes + off, sizeof(entry));
+        uint64_t target = base_va + (uint64_t)(int64_t)entry;
+        if (!mark_target_va(targets, text_len, text_vaddr, target)) {
+            break;
+        }
+        marked++;
+    }
+    return marked;
+}
+
+// Same walk for absolute jump tables (jmp *table(,%r,8) in non-PIC code):
+// 8-byte entries holding code addresses.
+static size_t walk_abs64_table(const struct peepopt_data_section *ds,
+                               uint64_t base_va, size_t end_off,
+                               uint64_t text_vaddr, size_t text_len,
+                               uint8_t *targets)
+{
+    size_t marked = 0;
+    for (size_t off = (size_t)(base_va - ds->vaddr); off + 8 <= end_off;
+         off += 8) {
+        uint64_t entry;
+        memcpy(&entry, ds->bytes + off, sizeof(entry));
+        if (!mark_target_va(targets, text_len, text_vaddr, entry)) {
+            break;
+        }
+        marked++;
+    }
+    return marked;
+}
+
+// Append a candidate table base to a realloc-doubling array. Returns false
+// on allocation failure.
+static bool append_table_base(struct table_base **arr, size_t *n, size_t *cap,
+                              uint64_t va, bool abs64)
+{
+    if (*n == *cap) {
+        size_t new_cap = *cap == 0 ? 64 : *cap * 2;
+        struct table_base *p = realloc(*arr, new_cap * sizeof(**arr));
+        if (p == NULL) {
+            return false;
+        }
+        *arr = p;
+        *cap = new_cap;
+    }
+    (*arr)[*n].va = va;
+    (*arr)[*n].abs64 = abs64;
+    (*n)++;
+    return true;
+}
+
 // Scan the section for PC-relative branch targets and record each target byte
 // offset in the bitmap. Used before rewriting to refuse any rewrite whose
 // interior bytes (i.e., anything other than the rewrite's first byte) is a
 // known jump destination.
 //
-// This covers direct Jcc/JMP/CALL rel. Indirect branches and jump-table
-// targets in .rodata are not detected — those remain a residual risk.
-static void collect_branch_targets(const uint8_t *inst, size_t len,
-                                    uint8_t *targets)
+// This covers direct Jcc/JMP/CALL rel. With a non-NULL ctx it additionally
+// covers switch jump tables (int32-relative tables reachable from a
+// RIP-relative LEA into a data section, and absolute tables referenced by
+// memory-indirect JMPs) and relocation-derived code pointers
+// (ctx->reloc_targets). Indirect branches whose targets are computed some
+// other way remain a residual risk.
+static int collect_branch_targets(const uint8_t *inst, size_t len,
+                                   const struct peepopt_ctx *ctx,
+                                   uint8_t *targets)
 {
     xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
     xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    size_t table_targets = 0;
+    size_t reloc_marked = 0;
+    struct table_base *bases = NULL;
+    size_t num_bases = 0;
+    size_t bases_cap = 0;
+
+    if (ctx != NULL) {
+        for (size_t i = 0; i < ctx->num_reloc_targets; i++) {
+            if (mark_target_va(targets, len, ctx->text_vaddr,
+                               ctx->reloc_targets[i])) {
+                reloc_marked++;
+            }
+        }
+    }
+
     for (size_t off = 0; off < len;) {
         xed_decoded_inst_t xedd;
         xed_decoded_inst_zero(&xedd);
         xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
         if (xed_decode(&xedd, inst + off, len - off) != XED_ERROR_NONE) {
-            return;
+            // The rewrite passes also stop decoding here, so nothing past
+            // this point gets rewritten; keep the targets collected so far.
+            break;
         }
+        xed_uint_t inst_len = xed_decoded_inst_get_length(&xedd);
         xed_category_enum_t cat = xed_decoded_inst_get_category(&xedd);
         if (xed_decoded_inst_get_branch_displacement_width(&xedd) > 0 &&
             (cat == XED_CATEGORY_COND_BR ||
              cat == XED_CATEGORY_UNCOND_BR ||
              cat == XED_CATEGORY_CALL)) {
             xed_int32_t disp = xed_decoded_inst_get_branch_displacement(&xedd);
-            xed_uint_t inst_len = xed_decoded_inst_get_length(&xedd);
             int64_t target = (int64_t)off + (int64_t)inst_len + (int64_t)disp;
             if (target >= 0 && (size_t)target < len) {
                 size_t t = (size_t)target;
                 targets[t / 8] |= (uint8_t)(1u << (t % 8));
             }
         }
-        off += xed_decoded_inst_get_length(&xedd);
+        if (ctx != NULL) {
+            xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&xedd);
+            if (iclass == XED_ICLASS_LEA &&
+                xed_decoded_inst_get_base_reg(&xedd, 0) == XED_REG_RIP) {
+                // Candidate PIC jump-table base: lea table(%rip),%reg.
+                xed_int64_t disp =
+                    xed_decoded_inst_get_memory_displacement(&xedd, 0);
+                uint64_t ea = ctx->text_vaddr + off + inst_len +
+                    (uint64_t)disp;
+                if (find_data_section(ctx, ea) != NULL &&
+                    !append_table_base(&bases, &num_bases, &bases_cap, ea,
+                                       /*abs64=*/ false)) {
+                    free(bases);
+                    return -1;
+                }
+            } else if (iclass == XED_ICLASS_JMP &&
+                       xed_decoded_inst_number_of_memory_operands(&xedd) > 0 &&
+                       xed_decoded_inst_get_base_reg(&xedd, 0) ==
+                           XED_REG_INVALID &&
+                       xed_decoded_inst_get_index_reg(&xedd, 0) !=
+                           XED_REG_INVALID &&
+                       xed_decoded_inst_get_scale(&xedd, 0) == 8) {
+                // Non-PIC absolute jump table: jmp *table(,%reg,8).
+                uint64_t ea = (uint64_t)
+                    xed_decoded_inst_get_memory_displacement(&xedd, 0);
+                if (find_data_section(ctx, ea) != NULL &&
+                    !append_table_base(&bases, &num_bases, &bases_cap, ea,
+                                       /*abs64=*/ true)) {
+                    free(bases);
+                    return -1;
+                }
+            }
+        }
+        off += inst_len;
     }
+
+    // Walk the candidate jump tables in address order, bounding each walk at
+    // the next candidate base: compilers pack tables back to back, and
+    // running past a table's end would interpret the following table's
+    // entries relative to the wrong base, marking large numbers of bogus
+    // addresses.
+    if (num_bases > 0) {
+        qsort(bases, num_bases, sizeof(*bases), table_base_cmp);
+        for (size_t i = 0; i < num_bases; i++) {
+            if (i > 0 && bases[i].va == bases[i - 1].va &&
+                bases[i].abs64 == bases[i - 1].abs64) {
+                continue;
+            }
+            const struct peepopt_data_section *ds =
+                find_data_section(ctx, bases[i].va);
+            size_t end_off = ds->size;
+            if (i + 1 < num_bases && bases[i + 1].va >= ds->vaddr &&
+                bases[i + 1].va - ds->vaddr < ds->size) {
+                end_off = (size_t)(bases[i + 1].va - ds->vaddr);
+            }
+            table_targets += bases[i].abs64
+                ? walk_abs64_table(ds, bases[i].va, end_off, ctx->text_vaddr,
+                                   len, targets)
+                : walk_rel32_table(ds, bases[i].va, end_off, ctx->text_vaddr,
+                                   len, targets);
+        }
+    }
+
+    if (ctx != NULL && g_verbose) {
+        size_t distinct = 0;
+        for (size_t i = 0; i < (len + 7) / 8; i++) {
+            distinct += (size_t)__builtin_popcount(targets[i]);
+        }
+        VLOG("branch-target scan: %zu jump-table bases (%zu entries), "
+             "%zu relocation targets, %zu distinct target bytes\n",
+             num_bases, table_targets, reloc_marked, distinct);
+    }
+    free(bases);
+    return 0;
 }
 
 // Returns true if any byte strictly between `lo` and `hi` (exclusive-exclusive
@@ -716,15 +924,18 @@ static bool target_in_interior(const uint8_t *targets, size_t lo, size_t hi)
     return false;
 }
 
-int check_shifts(uint8_t *inst, size_t len, bool replace)
+int check_shifts(uint8_t *inst, size_t len, bool replace,
+                 const struct peepopt_ctx *ctx)
 {
     size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
     uint8_t *targets = calloc(bitmap_bytes, 1);
     if (targets == NULL) {
         return -1;
     }
-    collect_branch_targets(inst, len, targets);
-    int result = check_shifts_impl(inst, len, replace, targets);
+    int result = -1;
+    if (collect_branch_targets(inst, len, ctx, targets) == 0) {
+        result = check_shifts_impl(inst, len, replace, targets);
+    }
     free(targets);
     return result;
 }
@@ -1287,15 +1498,18 @@ end:
 static int check_andn_impl(uint8_t *inst, size_t len, bool replace,
                             const uint8_t *branch_targets);
 
-int check_andn(uint8_t *inst, size_t len, bool replace)
+int check_andn(uint8_t *inst, size_t len, bool replace,
+               const struct peepopt_ctx *ctx)
 {
     size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
     uint8_t *targets = calloc(bitmap_bytes, 1);
     if (targets == NULL) {
         return -1;
     }
-    collect_branch_targets(inst, len, targets);
-    int result = check_andn_impl(inst, len, replace, targets);
+    int result = -1;
+    if (collect_branch_targets(inst, len, ctx, targets) == 0) {
+        result = check_andn_impl(inst, len, replace, targets);
+    }
     free(targets);
     return result;
 }
@@ -1721,15 +1935,18 @@ static xed_error_enum_t vex3_encode(xed_iclass_enum_t vex_iclass,
 static int check_vex3_impl(uint8_t *inst, size_t len, bool replace,
                             const uint8_t *branch_targets);
 
-int check_vex3(uint8_t *inst, size_t len, bool replace)
+int check_vex3(uint8_t *inst, size_t len, bool replace,
+               const struct peepopt_ctx *ctx)
 {
     size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
     uint8_t *targets = calloc(bitmap_bytes, 1);
     if (targets == NULL) {
         return -1;
     }
-    collect_branch_targets(inst, len, targets);
-    int result = check_vex3_impl(inst, len, replace, targets);
+    int result = -1;
+    if (collect_branch_targets(inst, len, ctx, targets) == 0) {
+        result = check_vex3_impl(inst, len, replace, targets);
+    }
     free(targets);
     return result;
 }
@@ -2241,15 +2458,18 @@ static xed_error_enum_t apx_setzu_encode(xed_iclass_enum_t iclass,
 static int check_apx_impl(uint8_t *inst, size_t len, bool replace,
                           const uint8_t *branch_targets);
 
-int check_apx(uint8_t *inst, size_t len, bool replace)
+int check_apx(uint8_t *inst, size_t len, bool replace,
+              const struct peepopt_ctx *ctx)
 {
     size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
     uint8_t *targets = calloc(bitmap_bytes, 1);
     if (targets == NULL) {
         return -1;
     }
-    collect_branch_targets(inst, len, targets);
-    int result = check_apx_impl(inst, len, replace, targets);
+    int result = -1;
+    if (collect_branch_targets(inst, len, ctx, targets) == 0) {
+        result = check_apx_impl(inst, len, replace, targets);
+    }
     free(targets);
     return result;
 }

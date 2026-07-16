@@ -222,4 +222,38 @@ apx_setzu_ext:
     mov %r8d, %eax
     ret
 
+    // Switch dispatch through an int32-relative .rodata jump table (the
+    // clang/gcc PIC lowering). Case 1's entry point is the second
+    // instruction of case 0's otherwise-fusable MOV+ADD pair: the
+    // branch-target verifier must refuse that fusion or entering at case 1
+    // would land inside the EVEX encoding. Case 2's pair has no interior
+    // entry point and must still fuse.
+    .globl apx_switch
+    .type apx_switch, @function
+apx_switch:
+    and $3, %edi
+    lea .Lapx_switch_table(%rip), %r8
+    movslq (%r8,%rdi,4), %r9
+    add %r8, %r9
+    mov %rdx, %rax              // defines rax for the case-1 entry
+    jmp *%r9
+.Lapx_switch_case0:
+    mov %rsi, %rax              // pair start: fusion refused (case 1 below)
+.Lapx_switch_case1:
+    add %rdx, %rax              // case 1 enters here mid-pair
+    ret
+.Lapx_switch_case2:
+    mov %rsi, %rax              // no interior entry point: fuses
+    sub %rdx, %rax
+    ret
+
+    .section .rodata
+    .align 4
+.Lapx_switch_table:
+    .long .Lapx_switch_case0 - .Lapx_switch_table
+    .long .Lapx_switch_case1 - .Lapx_switch_table
+    .long .Lapx_switch_case2 - .Lapx_switch_table
+    .long .Lapx_switch_case0 - .Lapx_switch_table
+    .text
+
     .section .note.GNU-stack,"",@progbits

@@ -20,11 +20,37 @@
 #include <stdint.h>
 #include <unistd.h>
 
+// A read-only data section (e.g. .rodata, .data.rel.ro) that may contain
+// switch jump tables referencing .text.
+struct peepopt_data_section {
+    const uint8_t *bytes;
+    uint64_t vaddr;
+    size_t size;
+};
+
+// Optional image-level context for branch-target collection. When present,
+// the rewrite passes additionally treat as branch targets: entries of
+// int32-relative jump tables reachable from RIP-relative LEAs into the data
+// sections, entries of absolute jump tables referenced by memory-indirect
+// JMPs, and relocation-derived code pointers supplied in reloc_targets.
+// Passing NULL only protects direct Jcc/JMP/CALL targets.
+struct peepopt_ctx {
+    uint64_t text_vaddr;
+    const struct peepopt_data_section *data_sections;  // .rodata, .data.rel.ro
+    size_t num_data_sections;
+    const uint64_t *reloc_targets;  // VAs inside .text, from RELA/RELR
+    size_t num_reloc_targets;
+};
+
 void peepopt_set_verbose(bool verbose);
 void peepopt_print_stats(void);
-int check_shifts(uint8_t *inst, size_t len, bool replace);
-int check_andn(uint8_t *inst, size_t len, bool replace);
-int check_vex3(uint8_t *inst, size_t len, bool replace);
-int check_apx(uint8_t *inst, size_t len, bool replace);
+int check_shifts(uint8_t *inst, size_t len, bool replace,
+                 const struct peepopt_ctx *ctx);
+int check_andn(uint8_t *inst, size_t len, bool replace,
+               const struct peepopt_ctx *ctx);
+int check_vex3(uint8_t *inst, size_t len, bool replace,
+               const struct peepopt_ctx *ctx);
+int check_apx(uint8_t *inst, size_t len, bool replace,
+              const struct peepopt_ctx *ctx);
 
 #endif

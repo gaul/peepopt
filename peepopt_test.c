@@ -28,7 +28,7 @@ static int failures = 0;
 #define CHECK_BYTES(expected, ...) \
 do { \
     uint8_t bytes[] = { __VA_ARGS__ }; \
-    int got = check_shifts(bytes, sizeof(bytes), /*replace=*/ false); \
+    int got = check_shifts(bytes, sizeof(bytes), /*replace=*/ false, /*ctx=*/ NULL); \
     if (got != (expected)) { \
         fprintf(stderr, "%s:%d: check_shifts returned %d, expected %d\n", \
                 __FILE__, __LINE__, got, (expected)); \
@@ -40,7 +40,7 @@ static void check_replace(int line, int expected_count,
                           const uint8_t *expect, size_t expect_len,
                           uint8_t *bytes, size_t len)
 {
-    int got = check_shifts(bytes, len, /*replace=*/ true);
+    int got = check_shifts(bytes, len, /*replace=*/ true, /*ctx=*/ NULL);
     if (got != expected_count) {
         fprintf(stderr, "peepopt_test.c:%d: check_shifts returned %d, expected %d\n",
                 line, got, expected_count);
@@ -62,7 +62,7 @@ static void check_apx_replace(int line, int expected_count,
                               const uint8_t *expect, size_t expect_len,
                               uint8_t *bytes, size_t len)
 {
-    int got = check_apx(bytes, len, /*replace=*/ true);
+    int got = check_apx(bytes, len, /*replace=*/ true, /*ctx=*/ NULL);
     if (got != expected_count) {
         fprintf(stderr, "peepopt_test.c:%d: check_apx returned %d, expected %d\n",
                 line, got, expected_count);
@@ -76,6 +76,19 @@ static void check_apx_replace(int line, int expected_count,
         fprintf(stderr, "\n  expect:  ");
         for (size_t i = 0; i < expect_len; ++i) fprintf(stderr, "%02X ", expect[i]);
         fprintf(stderr, "\n");
+        ++failures;
+    }
+}
+
+// Dry-run count check with an explicit image context (jump tables,
+// relocation targets).
+static void check_shifts_ctx(int line, int expected, uint8_t *bytes,
+                             size_t len, const struct peepopt_ctx *ctx)
+{
+    int got = check_shifts(bytes, len, /*replace=*/ false, ctx);
+    if (got != expected) {
+        fprintf(stderr, "peepopt_test.c:%d: check_shifts returned %d, expected %d\n",
+                line, got, expected);
         ++failures;
     }
 }
@@ -294,7 +307,7 @@ int main(int argc, char *argv[])
     /* ------ Zero-length input: returns 0 ------ */
     {
         uint8_t dummy[1] = {0};
-        int got = check_shifts(dummy, 0, /*replace=*/ false);
+        int got = check_shifts(dummy, 0, /*replace=*/ false, /*ctx=*/ NULL);
         if (got != 0) {
             fprintf(stderr, "peepopt_test.c:%d: zero-length check_shifts returned %d, expected 0\n",
                     __LINE__, got);
@@ -726,7 +739,7 @@ int main(int argc, char *argv[])
     #define CHECK_ANDN(expected, ...) \
     do { \
         uint8_t bytes[] = { __VA_ARGS__ }; \
-        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ false); \
+        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ false, /*ctx=*/ NULL); \
         if (got != (expected)) { \
             fprintf(stderr, "%s:%d: check_andn returned %d, expected %d\n", \
                     __FILE__, __LINE__, got, (expected)); \
@@ -764,7 +777,7 @@ int main(int argc, char *argv[])
             0x48, 0x31, 0xC0,              // xor %rax,%rax preserved
             0xC3,
         };
-        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ true);
+        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ true, /*ctx=*/ NULL);
         if (got != 1) {
             fprintf(stderr, "%s:%d: check_andn returned %d, expected 1\n",
                     __FILE__, __LINE__, got);
@@ -891,7 +904,7 @@ int main(int argc, char *argv[])
             0x90,                          // 1-byte NOP
             0xC3,
         };
-        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ true);
+        int got = check_andn(bytes, sizeof(bytes), /*replace=*/ true, /*ctx=*/ NULL);
         if (got != 1) {
             fprintf(stderr, "%s:%d: check_andn returned %d, expected 1\n",
                     __FILE__, __LINE__, got);
@@ -940,7 +953,7 @@ int main(int argc, char *argv[])
     #define CHECK_VEX3(expected, ...) \
     do { \
         uint8_t bytes[] = { __VA_ARGS__ }; \
-        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ false); \
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ false, /*ctx=*/ NULL); \
         if (got != (expected)) { \
             fprintf(stderr, "%s:%d: check_vex3 returned %d, expected %d\n", \
                     __FILE__, __LINE__, got, (expected)); \
@@ -960,7 +973,7 @@ int main(int argc, char *argv[])
             0xC5, 0xF2, 0x58, 0xD3,  // vaddss %xmm3,%xmm1,%xmm2
             0x0F, 0x1F, 0x00,        // 3-byte NOP
         };
-        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true, /*ctx=*/ NULL);
         if (got != 1) {
             fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
                     __FILE__, __LINE__, got);
@@ -987,7 +1000,7 @@ int main(int argc, char *argv[])
             0xC5, 0xD2, 0x5C, 0xC7,  // vsubss %xmm7,%xmm5,%xmm0
             0x0F, 0x1F, 0x00,        // 3-byte NOP
         };
-        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true, /*ctx=*/ NULL);
         if (got != 1) {
             fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
                     __FILE__, __LINE__, got);
@@ -1040,7 +1053,7 @@ int main(int argc, char *argv[])
             0x0F, 0x1F, 0x00,        // 3-byte NOP
             0xC3,
         };
-        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true, /*ctx=*/ NULL);
         if (got != 1) {
             fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
                     __FILE__, __LINE__, got);
@@ -1073,7 +1086,7 @@ int main(int argc, char *argv[])
             0x0F, 0x1F, 0x00,                          // 3-byte NOP
             0xC3,
         };
-        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true);
+        int got = check_vex3(bytes, sizeof(bytes), /*replace=*/ true, /*ctx=*/ NULL);
         if (got != 1) {
             fprintf(stderr, "%s:%d: check_vex3 returned %d, expected 1\n",
                     __FILE__, __LINE__, got);
@@ -1138,7 +1151,7 @@ int main(int argc, char *argv[])
     #define CHECK_APX(expected, ...) \
     do { \
         uint8_t bytes[] = { __VA_ARGS__ }; \
-        int got = check_apx(bytes, sizeof(bytes), /*replace=*/ false); \
+        int got = check_apx(bytes, sizeof(bytes), /*replace=*/ false, /*ctx=*/ NULL); \
         if (got != (expected)) { \
             fprintf(stderr, "%s:%d: check_apx returned %d, expected %d\n", \
                     __FILE__, __LINE__, got, (expected)); \
@@ -1972,6 +1985,131 @@ int main(int argc, char *argv[])
         0x0F, 0xB6, 0x07,        // movzx (%rdi),%eax
         0xC3
     );
+
+    /* ================= APX interior-branch refusals ================= */
+
+    /* `jmp +3` targets the ADD (offset 5), which the NDD fusion would bury
+       inside the six-byte EVEX encoding starting at offset 2. */
+    CHECK_APX(
+        0,
+        0xEB, 0x03,              // jmp +3   (target = offset 5 = the add)
+        0x48, 0x89, 0xF0,        // mov %rsi,%rax   (offset 2)
+        0x48, 0x01, 0xC8,        // add %rcx,%rax   (offset 5, jmp target)
+        0xC3
+    );
+
+    /* Jump to the fusion's first byte is safe: the NDD form starts there. */
+    CHECK_APX(
+        1,
+        0xEB, 0x00,              // jmp +0   (target = offset 2 = the mov)
+        0x48, 0x89, 0xF0,        // mov %rsi,%rax   (offset 2)
+        0x48, 0x01, 0xC8,        // add %rcx,%rax   (offset 5)
+        0xC3
+    );
+
+    /* Same for the SETcc+MOVZX -> SETZU rewrite: a branch targeting the
+       MOVZX (offset 5) must refuse the fusion... */
+    CHECK_APX(
+        0,
+        0xEB, 0x03,              // jmp +3   (target = offset 5 = the movzx)
+        0x0F, 0x94, 0xC0,        // setz %al        (offset 2)
+        0x0F, 0xB6, 0xC0,        // movzx %al,%eax  (offset 5, jmp target)
+        0xC3
+    );
+
+    /* ...while a branch to the SETcc's first byte is safe. */
+    CHECK_APX(
+        1,
+        0xEB, 0x00,              // jmp +0   (target = offset 2 = the setz)
+        0x0F, 0x94, 0xC0,        // setz %al        (offset 2)
+        0x0F, 0xB6, 0xC0,        // movzx %al,%eax  (offset 5)
+        0xC3
+    );
+
+    /* ================= Jump-table / relocation targets ================= */
+
+    /* PIC switch dispatch: `lea table(%rip),%rax` marks the int32-relative
+       table entries as branch targets. Layout: lea at 0 (7 bytes), mov at 7,
+       shl at 10, ret at 12; text_vaddr 0x1000, table at vaddr 0x2000. */
+    {
+        // lea effective address = 0x1000 + 7 + 0xFF9 = 0x2000
+        uint8_t bytes[] = {
+            0x48, 0x8D, 0x05, 0xF9, 0x0F, 0x00, 0x00,  // lea 0xFF9(%rip),%rax
+            0x44, 0x89, 0xC1,                          // mov %r8d,%ecx (offset 7)
+            0xD3, 0xE0,                                // shl %cl,%eax  (offset 10)
+            0xC3,                                      // ret           (offset 12)
+        };
+        // Entry 0 targets the SHL at VA 0x100A (interior of the rewrite
+        // span [7,12)); entry 1 leaves .text and terminates the walk.
+        static const int32_t interior_table[] = { 0x100A - 0x2000, 0 };
+        struct peepopt_data_section rodata = {
+            .bytes = (const uint8_t *)interior_table,
+            .vaddr = 0x2000,
+            .size = sizeof(interior_table),
+        };
+        struct peepopt_ctx ctx = {
+            .text_vaddr = 0x1000,
+            .data_sections = &rodata,
+            .num_data_sections = 1,
+        };
+        check_shifts_ctx(__LINE__, 0, bytes, sizeof(bytes), &ctx);
+
+        // An entry targeting the rewrite's first byte (the MOV at 0x1007)
+        // stays valid after the rewrite.
+        static const int32_t first_byte_table[] = { 0x1007 - 0x2000, 0 };
+        rodata.bytes = (const uint8_t *)first_byte_table;
+        rodata.size = sizeof(first_byte_table);
+        check_shifts_ctx(__LINE__, 1, bytes, sizeof(bytes), &ctx);
+
+        // A LEA pointing outside every data section must not suppress the
+        // rewrite (guards against over-broad marking).
+        rodata.vaddr = 0x8000;
+        check_shifts_ctx(__LINE__, 1, bytes, sizeof(bytes), &ctx);
+    }
+
+    /* Non-PIC absolute table: `jmp *0x2000(,%rax,8)` marks the 8-byte code
+       pointers in the table. Same layout as above (jmp is also 7 bytes). */
+    {
+        uint8_t bytes[] = {
+            0xFF, 0x24, 0xC5, 0x00, 0x20, 0x00, 0x00,  // jmp *0x2000(,%rax,8)
+            0x44, 0x89, 0xC1,                          // mov %r8d,%ecx (offset 7)
+            0xD3, 0xE0,                                // shl %cl,%eax  (offset 10)
+            0xC3,                                      // ret           (offset 12)
+        };
+        static const uint64_t abs_table[] = { 0x100A, 0 };
+        struct peepopt_data_section rodata = {
+            .bytes = (const uint8_t *)abs_table,
+            .vaddr = 0x2000,
+            .size = sizeof(abs_table),
+        };
+        struct peepopt_ctx ctx = {
+            .text_vaddr = 0x1000,
+            .data_sections = &rodata,
+            .num_data_sections = 1,
+        };
+        check_shifts_ctx(__LINE__, 0, bytes, sizeof(bytes), &ctx);
+    }
+
+    /* Relocation-derived code pointers (RELA/RELR): a target inside the
+       rewrite span refuses the rewrite; the first byte is safe. */
+    {
+        uint8_t bytes[] = {
+            0x44, 0x89, 0xC1,        // mov %r8d,%ecx (offset 0)
+            0xD3, 0xE0,              // shl %cl,%eax  (offset 3)
+            0xC3,                    // ret
+        };
+        uint64_t interior = 0x1003;  // the SHL, interior of span [0,5)
+        struct peepopt_ctx ctx = {
+            .text_vaddr = 0x1000,
+            .reloc_targets = &interior,
+            .num_reloc_targets = 1,
+        };
+        check_shifts_ctx(__LINE__, 0, bytes, sizeof(bytes), &ctx);
+
+        uint64_t first_byte = 0x1000;
+        ctx.reloc_targets = &first_byte;
+        check_shifts_ctx(__LINE__, 1, bytes, sizeof(bytes), &ctx);
+    }
 
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
