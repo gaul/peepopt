@@ -287,4 +287,17 @@ apx_lsda:
 .Lapx_lsda_cs_end:
     .text
 
+    // A symbol on the second instruction of a fusable pair (a hand-written
+    // assembly pattern): anything may reference apx_symbol_mid, so the
+    // branch-target verifier must treat the symbol value as a target and
+    // refuse the fusion (test-apx.sh asserts the pair survives).
+    .globl apx_symbol
+    .type apx_symbol, @function
+apx_symbol:
+    mov %rsi, %rax                     // pair start: fusion refused
+    .globl apx_symbol_mid
+apx_symbol_mid:
+    add %rdx, %rax                     // symbol lands here mid-pair
+    ret
+
     .section .note.GNU-stack,"",@progbits

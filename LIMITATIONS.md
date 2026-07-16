@@ -11,10 +11,12 @@ bounds what it can safely touch.
   referenced by `jmp *table(,%r,8)`), plus relocation-derived code pointers
   (RELATIVE/IRELATIVE RELA addends and RELR slot contents), which covers
   vtables, function pointers, and computed-goto labels in PIE/shared
-  objects. An indirect transfer whose target is computed some other way —
-  a table base materialized without a LEA, pointer arithmetic in
-  hand-written assembly, JIT dispatch, non-PIE absolute pointer tables with
-  no relocations — remains invisible.
+  objects, plus `.symtab`/`.dynsym` symbol values, which covers named
+  mid-function labels and ifunc resolvers. An indirect transfer whose
+  target is computed some other way — a table base materialized without a
+  LEA, pointer arithmetic in hand-written assembly targeting an unnamed
+  location, JIT dispatch, non-PIE absolute pointer tables with no
+  relocations, targets named only by stripped symbols — remains invisible.
 * **Jump-table extents are heuristic.** Table boundaries are not recorded in
   the binary, so each candidate table is walked until the next candidate
   base, the end of the section, or the first entry that does not land in

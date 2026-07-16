@@ -15,10 +15,11 @@ cp test-apx-fixture test-apx-fixture.opt
 ./peepopt -m apx test-apx-fixture.opt > apx-peepopt.log
 count=$(grep -c '^R apx ' apx-peepopt.log)
 echo "R apx rewrites: $count"
-# The 27 fixture bodies contribute 25 (the REX-less 32-bit pair must stay,
+# The 28 fixture bodies contribute 25 (the REX-less 32-bit pair must stay,
 # apx_switch's case-0 pair is refused because case 1 enters mid-pair while
-# its case-2 pair fuses, and apx_lsda's pair is refused because its landing
-# pad enters mid-pair); crt/driver code may legitimately add more.
+# its case-2 pair fuses, and the apx_lsda and apx_symbol pairs are refused
+# because a landing pad and a symbol enter mid-pair); crt/driver code may
+# legitimately add more.
 test "$count" -ge 25
 
 # apx_lsda's MOV+ADD must survive: its landing pad enters at the ADD, so
@@ -26,6 +27,11 @@ test "$count" -ge 25
 objdump -d test-apx-fixture.opt | \
     awk '/<apx_lsda>:/,/ret/' | grep -q 'mov.*%rsi,%rax'
 echo "apx_lsda pair not fused: OK"
+
+# Likewise apx_symbol's pair: apx_symbol_mid names its ADD.
+objdump -d test-apx-fixture.opt | \
+    awk '/<apx_symbol>:/,/ret/' | grep -q 'mov.*%rsi,%rax'
+echo "apx_symbol pair not fused: OK"
 
 "$SDE_PATH/sde64" $SDE_CHIP -- ./test-apx-fixture.opt > apx-rewritten.out
 diff apx-baseline.out apx-rewritten.out

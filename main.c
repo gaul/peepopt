@@ -731,13 +731,16 @@ int main(int argc, char **argv)
         }
     }
 
-    // Relocation pass: collect code pointers installed by the dynamic linker
-    // (vtables, function pointers, computed-goto labels). RELATIVE/IRELATIVE
-    // RELA entries carry the target in the addend; RELR entries name slots
-    // whose in-place value is the link-time target.
+    // Relocation and symbol pass: collect code pointers installed by the
+    // dynamic linker (vtables, function pointers, computed-goto labels) and
+    // symbol values. RELATIVE/IRELATIVE RELA entries carry the target in the
+    // addend; RELR entries name slots whose in-place value is the link-time
+    // target; .symtab/.dynsym st_values catch mid-function assembly labels,
+    // ifunc resolvers, and entry points nothing else mentions.
     uint64_t *extra_targets = NULL;
     size_t num_extra_targets = 0;
     size_t reloc_cap = 0;
+    size_t num_symbols = 0;
     bool reloc_oom = false;
     for (idx = 0; idx < elf_header->e_shnum && !reloc_oom; ++idx) {
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + elf_header->e_shoff + (uint64_t)idx * elf_header->e_shentsize);
@@ -789,6 +792,17 @@ int main(int argc, char **argv)
                     where += 63 * sizeof(uint64_t);
                 }
             }
+        } else if (sh->sh_type == SHT_SYMTAB || sh->sh_type == SHT_DYNSYM) {
+            size_t count = sh->sh_size / sizeof(Elf64_Sym);
+            const Elf64_Sym *syms = (const Elf64_Sym *)(file + sh->sh_offset);
+            for (size_t i = 0; i < count && !reloc_oom; ++i) {
+                if (va_in_exec(exec_ranges, num_exec_ranges,
+                               syms[i].st_value)) {
+                    reloc_oom = !append_va(&extra_targets, &num_extra_targets,
+                                           &reloc_cap, syms[i].st_value);
+                    ++num_symbols;
+                }
+            }
         }
     }
     if (reloc_oom) {
@@ -798,7 +812,7 @@ int main(int argc, char **argv)
         close(fd);
         return 1;
     }
-    size_t num_relocs = num_extra_targets;
+    size_t num_relocs = num_extra_targets - num_symbols;
 
     // Landing-pad pass: the unwinder branches to exception landing pads, so
     // they must be protected like any other branch target. Landing pads
@@ -825,8 +839,8 @@ int main(int argc, char **argv)
     }
     if (verbose) {
         printf("collected %zu data sections, %zu relocation code pointers, "
-               "%zu exception landing pads\n",
-               num_data_sections, num_relocs, num_landing_pads);
+               "%zu symbols, %zu exception landing pads\n",
+               num_data_sections, num_relocs, num_symbols, num_landing_pads);
     }
 
     // read all section headers
