@@ -204,11 +204,14 @@ XED_PATH=/path/to/xed make all
 ```
 
 Run the unit tests with `make test`.
-The APX end-to-end test additionally needs an [Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) kit:
+The APX end-to-end tests additionally need an [Intel SDE](https://www.intel.com/content/www/us/en/developer/articles/tool/software-development-emulator.html) kit:
 
 ```
 XED_PATH=/path/to/xed SDE_PATH=/path/to/sde make test-apx
+XED_PATH=/path/to/xed SDE_PATH=/path/to/sde make test-awk
 ```
+
+`test-apx` rewrites a hand-written assembly fixture; `test-awk` rewrites a copy of a real system binary (gawk, ~850 sites) and diffs its output over a broad interpreter workload against the original, exercising the jump-table and relocation target protection on real switch dispatch.
 
 ## Usage
 

@@ -27,6 +27,13 @@ test-apx: peepopt test-apx-fixture
 	@test -n "$(SDE_PATH)" || { echo "must provide SDE_PATH" >&2; exit 1; }
 	SDE_PATH="$(SDE_PATH)" SDE_CHIP="$(SDE_CHIP)" ./test-apx.sh
 
+# Rewrites a copy of a real system binary (gawk) and compares its behavior
+# under SDE against the original; requires SDE_PATH (and optionally
+# SDE_CHIP and AWK_BIN).
+test-awk: peepopt
+	@test -n "$(SDE_PATH)" || { echo "must provide SDE_PATH" >&2; exit 1; }
+	SDE_PATH="$(SDE_PATH)" SDE_CHIP="$(SDE_CHIP)" ./test-awk.sh
+
 clean:
 	rm -f \
 		peepopt \
@@ -35,4 +42,8 @@ clean:
 		test-apx-fixture.opt \
 		apx-*.out \
 		apx-*.log \
+		test-awk-bin.opt \
+		awk-input.txt \
+		awk-*.out \
+		awk-*.log \
 		*.o
