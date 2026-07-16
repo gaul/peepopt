@@ -256,4 +256,35 @@ apx_switch:
     .long .Lapx_switch_case0 - .Lapx_switch_table
     .text
 
+    // Exception landing pad entering mid-pair: the hand-built LSDA below
+    // says the unwinder may transfer control to .Lapx_lsda_pad, the second
+    // instruction of an otherwise-fusable MOV+ADD pair. The branch-target
+    // verifier must parse .eh_frame/.gcc_except_table and refuse the fusion
+    // (test-apx.sh asserts the pair survives via objdump).
+    .globl apx_lsda
+    .type apx_lsda, @function
+apx_lsda:
+    .cfi_startproc
+    .cfi_lsda 0x1b, .Lapx_lsda_lsda    // pcrel|sdata4 LSDA pointer
+    mov %rsi, %rax                     // pair start: fusion refused
+.Lapx_lsda_pad:
+    add %rdx, %rax                     // landing pad enters here mid-pair
+    ret
+    .cfi_endproc
+
+    .section .gcc_except_table,"a",@progbits
+    .align 4
+.Lapx_lsda_lsda:
+    .byte 0xFF                                  // @LPStart: omit (= function start)
+    .byte 0xFF                                  // @TType: omit
+    .byte 0x01                                  // call-site encoding: uleb128
+    .uleb128 .Lapx_lsda_cs_end - .Lapx_lsda_cs  // call-site table length
+.Lapx_lsda_cs:
+    .uleb128 0                                  // region start (function-relative)
+    .uleb128 .Lapx_lsda_pad - apx_lsda          // region length
+    .uleb128 .Lapx_lsda_pad - apx_lsda          // landing pad offset
+    .uleb128 0                                  // action: cleanup
+.Lapx_lsda_cs_end:
+    .text
+
     .section .note.GNU-stack,"",@progbits

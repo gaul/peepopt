@@ -49,6 +49,7 @@ uint64_t apx_load_selfptr(const uint64_t *p, uint64_t y);
 uint64_t apx_setzu(uint64_t x, uint64_t y);
 uint64_t apx_setzu_ext(uint64_t x, uint64_t y);
 uint64_t apx_switch(uint64_t sel, uint64_t x, uint64_t y);
+uint64_t apx_lsda(uint64_t unused, uint64_t x, uint64_t y);
 
 int main(void)
 {
@@ -96,6 +97,7 @@ int main(void)
                 printf("switch(%" PRIu64 ")=%" PRIx64 "\n",
                        sel, apx_switch(sel, x, y));
             }
+            printf("lsda=%" PRIx64 "\n", apx_lsda(0, x, y));
         }
     }
     return 0;

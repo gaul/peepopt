@@ -2101,13 +2101,13 @@ int main(int argc, char *argv[])
         uint64_t interior = 0x1003;  // the SHL, interior of span [0,5)
         struct peepopt_ctx ctx = {
             .text_vaddr = 0x1000,
-            .reloc_targets = &interior,
-            .num_reloc_targets = 1,
+            .extra_targets = &interior,
+            .num_extra_targets = 1,
         };
         check_shifts_ctx(__LINE__, 0, bytes, sizeof(bytes), &ctx);
 
         uint64_t first_byte = 0x1000;
-        ctx.reloc_targets = &first_byte;
+        ctx.extra_targets = &first_byte;
         check_shifts_ctx(__LINE__, 1, bytes, sizeof(bytes), &ctx);
     }
 

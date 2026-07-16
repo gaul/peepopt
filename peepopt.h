@@ -32,14 +32,15 @@ struct peepopt_data_section {
 // the rewrite passes additionally treat as branch targets: entries of
 // int32-relative jump tables reachable from RIP-relative LEAs into the data
 // sections, entries of absolute jump tables referenced by memory-indirect
-// JMPs, and relocation-derived code pointers supplied in reloc_targets.
-// Passing NULL only protects direct Jcc/JMP/CALL targets.
+// JMPs, and the code addresses supplied in extra_targets (relocation-derived
+// pointers, exception landing pads). Passing NULL only protects direct
+// Jcc/JMP/CALL targets.
 struct peepopt_ctx {
     uint64_t text_vaddr;
     const struct peepopt_data_section *data_sections;  // .rodata, .data.rel.ro
     size_t num_data_sections;
-    const uint64_t *reloc_targets;  // VAs inside .text, from RELA/RELR
-    size_t num_reloc_targets;
+    const uint64_t *extra_targets;  // VAs inside .text: RELA/RELR, landing pads
+    size_t num_extra_targets;
 };
 
 void peepopt_set_verbose(bool verbose);

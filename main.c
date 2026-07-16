@@ -65,9 +65,10 @@ static bool append_va(uint64_t **arr, size_t *n, size_t *cap, uint64_t va)
 
 // Map a virtual address to its file bytes by finding the SHF_ALLOC section
 // containing it. Returns NULL if unmapped or fewer than `need` bytes remain.
+// When `avail` is non-NULL it receives the bytes remaining in the section.
 static const uint8_t *va_to_file(const uint8_t *file, size_t file_size,
                                  const Elf64_Ehdr *eh, uint64_t va,
-                                 size_t need)
+                                 size_t need, size_t *avail)
 {
     for (uint32_t i = 0; i < eh->e_shnum; ++i) {
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + eh->e_shoff +
@@ -82,6 +83,9 @@ static const uint8_t *va_to_file(const uint8_t *file, size_t file_size,
         if (sh->sh_offset > file_size ||
             sh->sh_size > file_size - sh->sh_offset) {
             continue;
+        }
+        if (avail != NULL) {
+            *avail = sh->sh_size - (va - sh->sh_addr);
         }
         return file + sh->sh_offset + (va - sh->sh_addr);
     }
@@ -98,7 +102,7 @@ static bool add_relr_slot(const uint8_t *file, size_t file_size,
                           uint64_t **arr, size_t *n, size_t *cap)
 {
     const uint8_t *p = va_to_file(file, file_size, eh, slot_va,
-                                  sizeof(uint64_t));
+                                  sizeof(uint64_t), NULL);
     if (p == NULL) {
         return true;  // unmapped slot: nothing to record
     }
@@ -108,6 +112,442 @@ static bool add_relr_slot(const uint8_t *file, size_t file_size,
         return true;
     }
     return append_va(arr, n, cap, value);
+}
+
+// DWARF exception-header pointer encodings (the subset gcc/clang emit).
+#define DW_EH_PE_absptr   0x00
+#define DW_EH_PE_uleb128  0x01
+#define DW_EH_PE_udata2   0x02
+#define DW_EH_PE_udata4   0x03
+#define DW_EH_PE_udata8   0x04
+#define DW_EH_PE_sleb128  0x09
+#define DW_EH_PE_sdata2   0x0A
+#define DW_EH_PE_sdata4   0x0B
+#define DW_EH_PE_sdata8   0x0C
+#define DW_EH_PE_pcrel    0x10
+#define DW_EH_PE_indirect 0x80
+#define DW_EH_PE_omit     0xFF
+
+// Bounds-checked reader over a byte range whose virtual address is tracked
+// so pcrel-encoded pointers can be resolved.
+struct eh_cursor {
+    const uint8_t *p;
+    const uint8_t *end;
+    uint64_t va;
+};
+
+static bool cur_u8(struct eh_cursor *c, uint8_t *out)
+{
+    if (c->end - c->p < 1) {
+        return false;
+    }
+    *out = *c->p++;
+    c->va++;
+    return true;
+}
+
+static bool cur_bytes(struct eh_cursor *c, void *out, size_t n)
+{
+    if ((size_t)(c->end - c->p) < n) {
+        return false;
+    }
+    memcpy(out, c->p, n);
+    c->p += n;
+    c->va += n;
+    return true;
+}
+
+static bool cur_uleb(struct eh_cursor *c, uint64_t *out)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    while (c->p < c->end) {
+        uint8_t byte = *c->p++;
+        c->va++;
+        if (shift < 64) {
+            result |= (uint64_t)(byte & 0x7F) << shift;
+        }
+        shift += 7;
+        if ((byte & 0x80) == 0) {
+            *out = result;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cur_sleb(struct eh_cursor *c, int64_t *out)
+{
+    uint64_t result = 0;
+    int shift = 0;
+    while (c->p < c->end) {
+        uint8_t byte = *c->p++;
+        c->va++;
+        if (shift < 64) {
+            result |= (uint64_t)(byte & 0x7F) << shift;
+        }
+        shift += 7;
+        if ((byte & 0x80) == 0) {
+            if (shift < 64 && (byte & 0x40)) {
+                result |= ~UINT64_C(0) << shift;
+            }
+            *out = (int64_t)result;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Read the value portion of an encoded pointer (the low-nibble format),
+// without applying the high-nibble base. Used to skip fields and to read
+// offsets like call-site entries whose format nibble is all that matters.
+static bool cur_encoded_value(struct eh_cursor *c, uint8_t format,
+                              uint64_t *out)
+{
+    switch (format) {
+    case DW_EH_PE_absptr:
+    case DW_EH_PE_udata8:
+    case DW_EH_PE_sdata8:
+        return cur_bytes(c, out, 8);
+    case DW_EH_PE_uleb128:
+        return cur_uleb(c, out);
+    case DW_EH_PE_udata2: {
+        uint16_t v;
+        if (!cur_bytes(c, &v, 2)) {
+            return false;
+        }
+        *out = v;
+        return true;
+    }
+    case DW_EH_PE_udata4: {
+        uint32_t v;
+        if (!cur_bytes(c, &v, 4)) {
+            return false;
+        }
+        *out = v;
+        return true;
+    }
+    case DW_EH_PE_sleb128: {
+        int64_t v;
+        if (!cur_sleb(c, &v)) {
+            return false;
+        }
+        *out = (uint64_t)v;
+        return true;
+    }
+    case DW_EH_PE_sdata2: {
+        int16_t v;
+        if (!cur_bytes(c, &v, 2)) {
+            return false;
+        }
+        *out = (uint64_t)(int64_t)v;
+        return true;
+    }
+    case DW_EH_PE_sdata4: {
+        int32_t v;
+        if (!cur_bytes(c, &v, 4)) {
+            return false;
+        }
+        *out = (uint64_t)(int64_t)v;
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+// Read a fully encoded pointer, applying the pcrel base when present. A raw
+// value of zero decodes to the NULL pointer per convention. Indirect
+// encodings cannot be resolved statically and fail.
+static bool cur_encoded(struct eh_cursor *c, uint8_t enc, uint64_t *out)
+{
+    if (enc == DW_EH_PE_omit || (enc & DW_EH_PE_indirect)) {
+        return false;
+    }
+    uint64_t base_va = c->va;
+    uint64_t raw;
+    if (!cur_encoded_value(c, enc & 0x0F, &raw)) {
+        return false;
+    }
+    if (raw == 0) {
+        *out = 0;
+        return true;
+    }
+    switch (enc & 0x70) {
+    case 0x00:
+        *out = raw;
+        return true;
+    case DW_EH_PE_pcrel:
+        *out = base_va + raw;  // sdata formats wrap correctly
+        return true;
+    default:
+        return false;
+    }
+}
+
+// What an FDE needs from its CIE.
+struct cie_info {
+    uint64_t off;  // offset of the CIE within .eh_frame
+    bool has_z;
+    bool has_lsda;
+    uint8_t lsda_enc;
+    uint8_t fde_enc;
+};
+
+// Parse one LSDA (in .gcc_except_table) and record every landing pad that
+// lands in an executable section. Landing pads default to being relative to
+// the function start (@LPStart omitted). Returns false on malformed or
+// unsupported data — the caller fails closed.
+static bool collect_lsda_landing_pads(const uint8_t *file, size_t file_size,
+                                      const Elf64_Ehdr *eh, uint64_t lsda_va,
+                                      uint64_t func_va,
+                                      const struct exec_range *exec,
+                                      size_t num_exec, uint64_t **arr,
+                                      size_t *n, size_t *cap, bool *oom)
+{
+    size_t avail;
+    const uint8_t *p = va_to_file(file, file_size, eh, lsda_va, 1, &avail);
+    if (p == NULL) {
+        return false;
+    }
+    struct eh_cursor c = { p, p + avail, lsda_va };
+
+    uint8_t lpstart_enc;
+    if (!cur_u8(&c, &lpstart_enc)) {
+        return false;
+    }
+    uint64_t lpstart = func_va;
+    if (lpstart_enc != DW_EH_PE_omit &&
+        !cur_encoded(&c, lpstart_enc, &lpstart)) {
+        return false;
+    }
+
+    uint8_t ttype_enc;
+    uint64_t ttype_off;
+    if (!cur_u8(&c, &ttype_enc)) {
+        return false;
+    }
+    if (ttype_enc != DW_EH_PE_omit && !cur_uleb(&c, &ttype_off)) {
+        return false;
+    }
+
+    uint8_t cs_enc;
+    uint64_t cs_len;
+    if (!cur_u8(&c, &cs_enc) || (cs_enc & 0xF0) != 0 ||
+        !cur_uleb(&c, &cs_len)) {
+        return false;
+    }
+    if ((uint64_t)(c.end - c.p) < cs_len) {
+        return false;
+    }
+    const uint8_t *cs_end = c.p + cs_len;
+    while (c.p < cs_end) {
+        uint64_t cs_start, cs_length, cs_lp, cs_action;
+        if (!cur_encoded_value(&c, cs_enc, &cs_start) ||
+            !cur_encoded_value(&c, cs_enc, &cs_length) ||
+            !cur_encoded_value(&c, cs_enc, &cs_lp) ||
+            !cur_uleb(&c, &cs_action)) {
+            return false;
+        }
+        if (cs_lp != 0) {
+            uint64_t target = lpstart + cs_lp;
+            if (va_in_exec(exec, num_exec, target) &&
+                !append_va(arr, n, cap, target)) {
+                *oom = true;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+// Walk .eh_frame's CIEs and FDEs to find each function's LSDA and collect
+// its exception landing pads: the unwinder transfers control to them, so
+// they are branch targets no relocation or jump table mentions. Returns
+// false on malformed or unsupported data — landing pads that cannot be
+// enumerated make rewriting unsafe, so the caller must fail closed.
+static bool collect_landing_pads(const uint8_t *file, size_t file_size,
+                                 const Elf64_Ehdr *eh,
+                                 const uint8_t *eh_frame, size_t eh_frame_len,
+                                 uint64_t eh_frame_va,
+                                 const struct exec_range *exec,
+                                 size_t num_exec, uint64_t **arr, size_t *n,
+                                 size_t *cap, size_t *num_pads, bool *oom)
+{
+    struct cie_info *cies = NULL;
+    size_t num_cies = 0;
+    size_t cies_cap = 0;
+    struct eh_cursor c = { eh_frame, eh_frame + eh_frame_len, eh_frame_va };
+    bool ok = false;
+
+    while ((size_t)(c.end - c.p) >= 4) {
+        uint64_t entry_off = (uint64_t)(c.p - eh_frame);
+        uint32_t length;
+        if (!cur_bytes(&c, &length, 4)) {
+            goto out;
+        }
+        if (length == 0) {
+            break;  // terminator
+        }
+        if (length == UINT32_MAX ||
+            (uint64_t)(c.end - c.p) < length) {
+            goto out;  // 64-bit records unsupported
+        }
+        struct eh_cursor entry = { c.p, c.p + length, c.va };
+        c.p += length;
+        c.va += length;
+
+        uint64_t id_va = entry.va;
+        uint32_t cie_id;
+        if (!cur_bytes(&entry, &cie_id, 4)) {
+            goto out;
+        }
+        if (cie_id == 0) {
+            // CIE: recover the augmentation layout and pointer encodings.
+            struct cie_info info = {
+                .off = entry_off,
+                .fde_enc = DW_EH_PE_absptr,
+            };
+            uint8_t version;
+            if (!cur_u8(&entry, &version) ||
+                (version != 1 && version != 3 && version != 4)) {
+                goto out;
+            }
+            char aug[8];
+            size_t aug_len = 0;
+            for (;;) {
+                uint8_t ch;
+                if (!cur_u8(&entry, &ch) || aug_len >= sizeof(aug)) {
+                    goto out;
+                }
+                aug[aug_len++] = (char)ch;
+                if (ch == '\0') {
+                    break;
+                }
+            }
+            if (version == 4) {
+                uint8_t address_size, segment_size;
+                if (!cur_u8(&entry, &address_size) || address_size != 8 ||
+                    !cur_u8(&entry, &segment_size) || segment_size != 0) {
+                    goto out;
+                }
+            }
+            uint64_t code_align;
+            int64_t data_align;
+            if (!cur_uleb(&entry, &code_align) ||
+                !cur_sleb(&entry, &data_align)) {
+                goto out;
+            }
+            uint64_t ret_reg;
+            if (version == 1) {
+                uint8_t r;
+                if (!cur_u8(&entry, &r)) {
+                    goto out;
+                }
+                ret_reg = r;
+            } else if (!cur_uleb(&entry, &ret_reg)) {
+                goto out;
+            }
+            if (aug[0] == 'z') {
+                info.has_z = true;
+                uint64_t aug_data_len;
+                if (!cur_uleb(&entry, &aug_data_len)) {
+                    goto out;
+                }
+                for (size_t i = 1; aug[i] != '\0'; i++) {
+                    uint8_t penc;
+                    uint64_t skip;
+                    switch (aug[i]) {
+                    case 'L':
+                        info.has_lsda = true;
+                        if (!cur_u8(&entry, &info.lsda_enc)) {
+                            goto out;
+                        }
+                        break;
+                    case 'P':
+                        // Skip the personality routine pointer; indirect
+                        // encodings are fine to skip by format size.
+                        if (!cur_u8(&entry, &penc) ||
+                            !cur_encoded_value(&entry, penc & 0x0F, &skip)) {
+                            goto out;
+                        }
+                        break;
+                    case 'R':
+                        if (!cur_u8(&entry, &info.fde_enc)) {
+                            goto out;
+                        }
+                        break;
+                    case 'S':
+                    case 'B':
+                        break;  // no augmentation data
+                    default:
+                        goto out;  // unknown layout: fail closed
+                    }
+                }
+            } else if (aug[0] != '\0') {
+                goto out;  // pre-"z" augmentations unsupported
+            }
+            if (num_cies == cies_cap) {
+                size_t new_cap = cies_cap == 0 ? 4 : cies_cap * 2;
+                struct cie_info *q =
+                    realloc(cies, new_cap * sizeof(*cies));
+                if (q == NULL) {
+                    *oom = true;
+                    goto out;
+                }
+                cies = q;
+                cies_cap = new_cap;
+            }
+            cies[num_cies++] = info;
+        } else {
+            // FDE: cie_id is the distance back from the id field to its CIE.
+            uint64_t cie_off = entry_off + 4 - cie_id;
+            const struct cie_info *info = NULL;
+            for (size_t i = 0; i < num_cies; i++) {
+                if (cies[i].off == cie_off) {
+                    info = &cies[i];
+                    break;
+                }
+            }
+            if (info == NULL) {
+                goto out;
+            }
+            (void)id_va;
+            uint64_t pc_begin, pc_range;
+            if (!cur_encoded(&entry, info->fde_enc, &pc_begin) ||
+                !cur_encoded_value(&entry, info->fde_enc & 0x0F, &pc_range)) {
+                goto out;
+            }
+            if (!info->has_z) {
+                continue;  // no augmentation data, so no LSDA
+            }
+            uint64_t aug_data_len;
+            if (!cur_uleb(&entry, &aug_data_len)) {
+                goto out;
+            }
+            if (!info->has_lsda || aug_data_len == 0) {
+                continue;
+            }
+            uint64_t lsda_va;
+            if (!cur_encoded(&entry, info->lsda_enc, &lsda_va)) {
+                goto out;
+            }
+            if (lsda_va == 0) {
+                continue;
+            }
+            size_t before = *n;
+            if (!collect_lsda_landing_pads(file, file_size, eh, lsda_va,
+                                           pc_begin, exec, num_exec, arr, n,
+                                           cap, oom)) {
+                goto out;
+            }
+            *num_pads += *n - before;
+        }
+    }
+    ok = true;
+out:
+    free(cies);
+    return ok;
 }
 
 static void usage(const char *program)
@@ -255,6 +695,9 @@ int main(int argc, char **argv)
     size_t num_data_sections = 0;
     struct exec_range exec_ranges[16];
     size_t num_exec_ranges = 0;
+    const uint8_t *eh_frame = NULL;
+    size_t eh_frame_len = 0;
+    uint64_t eh_frame_va = 0;
     for (idx = 0; idx < elf_header->e_shnum; ++idx) {
         const Elf64_Shdr *sh = (const Elf64_Shdr *)(file + elf_header->e_shoff + (uint64_t)idx * elf_header->e_shentsize);
         if (sh->sh_offset > file_size ||
@@ -281,14 +724,19 @@ int main(int argc, char **argv)
             data_sections[num_data_sections].size = sh->sh_size;
             ++num_data_sections;
         }
+        if (sh->sh_type != SHT_NOBITS && strcmp(name, ".eh_frame") == 0) {
+            eh_frame = file + sh->sh_offset;
+            eh_frame_len = sh->sh_size;
+            eh_frame_va = sh->sh_addr;
+        }
     }
 
     // Relocation pass: collect code pointers installed by the dynamic linker
     // (vtables, function pointers, computed-goto labels). RELATIVE/IRELATIVE
     // RELA entries carry the target in the addend; RELR entries name slots
     // whose in-place value is the link-time target.
-    uint64_t *reloc_targets = NULL;
-    size_t num_reloc_targets = 0;
+    uint64_t *extra_targets = NULL;
+    size_t num_extra_targets = 0;
     size_t reloc_cap = 0;
     bool reloc_oom = false;
     for (idx = 0; idx < elf_header->e_shnum && !reloc_oom; ++idx) {
@@ -307,7 +755,7 @@ int main(int argc, char **argv)
                 }
                 uint64_t va = (uint64_t)rela[i].r_addend;
                 if (va_in_exec(exec_ranges, num_exec_ranges, va)) {
-                    reloc_oom = !append_va(&reloc_targets, &num_reloc_targets,
+                    reloc_oom = !append_va(&extra_targets, &num_extra_targets,
                                            &reloc_cap, va);
                 }
             }
@@ -323,8 +771,8 @@ int main(int argc, char **argv)
                 if ((entry & 1) == 0) {
                     reloc_oom = !add_relr_slot(file, file_size, elf_header,
                                                exec_ranges, num_exec_ranges,
-                                               entry, &reloc_targets,
-                                               &num_reloc_targets, &reloc_cap);
+                                               entry, &extra_targets,
+                                               &num_extra_targets, &reloc_cap);
                     where = entry + sizeof(uint64_t);
                 } else {
                     for (int bit = 0; (entry >>= 1) != 0 && !reloc_oom;
@@ -334,7 +782,7 @@ int main(int argc, char **argv)
                                     file, file_size, elf_header,
                                     exec_ranges, num_exec_ranges,
                                     where + (uint64_t)bit * sizeof(uint64_t),
-                                    &reloc_targets, &num_reloc_targets,
+                                    &extra_targets, &num_extra_targets,
                                     &reloc_cap);
                         }
                     }
@@ -345,14 +793,40 @@ int main(int argc, char **argv)
     }
     if (reloc_oom) {
         fprintf(stderr, "out of memory collecting relocation targets\n");
-        free(reloc_targets);
+        free(extra_targets);
         munmap(addr, file_size);
         close(fd);
         return 1;
     }
+    size_t num_relocs = num_extra_targets;
+
+    // Landing-pad pass: the unwinder branches to exception landing pads, so
+    // they must be protected like any other branch target. Landing pads
+    // that cannot be enumerated would make every rewrite in their function
+    // unsafe, so a malformed or unsupported .eh_frame is a hard error.
+    size_t num_landing_pads = 0;
+    if (eh_frame != NULL) {
+        bool eh_oom = false;
+        if (!collect_landing_pads(file, file_size, elf_header, eh_frame,
+                                  eh_frame_len, eh_frame_va, exec_ranges,
+                                  num_exec_ranges, &extra_targets,
+                                  &num_extra_targets, &reloc_cap,
+                                  &num_landing_pads, &eh_oom)) {
+            fprintf(stderr, eh_oom
+                    ? "out of memory collecting landing pads\n"
+                    : "cannot parse .eh_frame/.gcc_except_table; exception "
+                      "landing pads would be unprotected, refusing to "
+                      "rewrite\n");
+            free(extra_targets);
+            munmap(addr, file_size);
+            close(fd);
+            return 1;
+        }
+    }
     if (verbose) {
-        printf("collected %zu data sections, %zu relocation code pointers\n",
-               num_data_sections, num_reloc_targets);
+        printf("collected %zu data sections, %zu relocation code pointers, "
+               "%zu exception landing pads\n",
+               num_data_sections, num_relocs, num_landing_pads);
     }
 
     // read all section headers
@@ -388,13 +862,13 @@ int main(int argc, char **argv)
             .text_vaddr = section_header->sh_addr,
             .data_sections = data_sections,
             .num_data_sections = num_data_sections,
-            .reloc_targets = reloc_targets,
-            .num_reloc_targets = num_reloc_targets,
+            .extra_targets = extra_targets,
+            .num_extra_targets = num_extra_targets,
         };
         int section_rewrites = check_shifts(buf, section_header->sh_size, /*replace=*/ !dry_run, &ctx);
         if (section_rewrites < 0) {
             fprintf(stderr, "check_shifts failed on section %u\n", idx);
-            free(reloc_targets);
+            free(extra_targets);
             munmap(addr, file_size);
             close(fd);
             return 1;
@@ -403,7 +877,7 @@ int main(int argc, char **argv)
         int andn_rewrites = check_andn(buf, section_header->sh_size, /*replace=*/ !dry_run, &ctx);
         if (andn_rewrites < 0) {
             fprintf(stderr, "check_andn failed on section %u\n", idx);
-            free(reloc_targets);
+            free(extra_targets);
             munmap(addr, file_size);
             close(fd);
             return 1;
@@ -412,7 +886,7 @@ int main(int argc, char **argv)
         int vex3_rewrites = check_vex3(buf, section_header->sh_size, /*replace=*/ !dry_run, &ctx);
         if (vex3_rewrites < 0) {
             fprintf(stderr, "check_vex3 failed on section %u\n", idx);
-            free(reloc_targets);
+            free(extra_targets);
             munmap(addr, file_size);
             close(fd);
             return 1;
@@ -422,7 +896,7 @@ int main(int argc, char **argv)
             int apx_rewrites = check_apx(buf, section_header->sh_size, /*replace=*/ !dry_run, &ctx);
             if (apx_rewrites < 0) {
                 fprintf(stderr, "check_apx failed on section %u\n", idx);
-                free(reloc_targets);
+                free(extra_targets);
                 munmap(addr, file_size);
                 close(fd);
                 return 1;
@@ -430,7 +904,7 @@ int main(int argc, char **argv)
             rewrites += apx_rewrites;
         }
     }
-    free(reloc_targets);
+    free(extra_targets);
 
     if (stats) {
         peepopt_print_stats();

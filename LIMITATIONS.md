@@ -22,10 +22,14 @@ bounds what it can safely touch.
   could in principle under-mark if a LEA elsewhere targets the interior of a
   real jump table — a pattern compilers do not emit, since tables are
   anonymous objects referenced only through their base.
-* **No exception-handling awareness.** `.eh_frame` and `.gcc_except_table`
-  describe exception landing pads. peepopt does not parse them, so if a
-  landing pad points into an absorbed range, the frame info for that
-  function becomes stale.
+* **Exception landing pads are protected; other EH metadata is not
+  updated.** peepopt walks `.eh_frame` FDEs to each function's LSDA in
+  `.gcc_except_table` and treats every landing pad as a branch target, so
+  rewrites never bury an unwinder entry point. A malformed or unsupported
+  `.eh_frame` is a hard error rather than a silent gap. Call-site ranges
+  and DWARF CFI programs are not rewritten, which is harmless because
+  rewrites preserve instruction span boundaries and never touch the stack
+  layout.
 * **No debug-info updating.** DWARF line tables still point at the original
   instruction boundaries after rewriting. Debuggers may report odd source
   mappings inside rewritten ranges, but unwinding continues to work because

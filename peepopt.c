@@ -789,7 +789,7 @@ static bool append_table_base(struct table_base **arr, size_t *n, size_t *cap,
 // covers switch jump tables (int32-relative tables reachable from a
 // RIP-relative LEA into a data section, and absolute tables referenced by
 // memory-indirect JMPs) and relocation-derived code pointers
-// (ctx->reloc_targets). Indirect branches whose targets are computed some
+// (ctx->extra_targets). Indirect branches whose targets are computed some
 // other way remain a residual risk.
 static int collect_branch_targets(const uint8_t *inst, size_t len,
                                    const struct peepopt_ctx *ctx,
@@ -804,9 +804,9 @@ static int collect_branch_targets(const uint8_t *inst, size_t len,
     size_t bases_cap = 0;
 
     if (ctx != NULL) {
-        for (size_t i = 0; i < ctx->num_reloc_targets; i++) {
+        for (size_t i = 0; i < ctx->num_extra_targets; i++) {
             if (mark_target_va(targets, len, ctx->text_vaddr,
-                               ctx->reloc_targets[i])) {
+                               ctx->extra_targets[i])) {
                 reloc_marked++;
             }
         }
