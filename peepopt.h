@@ -34,7 +34,7 @@ struct peepopt_data_section {
 // sections, entries of absolute jump tables referenced by memory-indirect
 // JMPs, and the code addresses supplied in extra_targets (relocation-derived
 // pointers, exception landing pads). Passing NULL only protects direct
-// Jcc/JMP/CALL targets.
+// Jcc/JMP/CALL targets and ENDBR landing sites.
 struct peepopt_ctx {
     uint64_t text_vaddr;
     const struct peepopt_data_section *data_sections;  // .rodata, .data.rel.ro

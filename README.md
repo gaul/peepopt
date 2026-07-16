@@ -49,7 +49,7 @@ When rewriting instructions peepopt examines subsequent instructions to ensure t
 
 peepopt currently implements three always-on families of rewrites within the x86-64-v3 feature level (BMI1, BMI2, AVX), plus an opt-in APX family (`-m apx`).
 Every replacement fits within the bytes of the original instructions — shorter replacements are padded with no-ops — and is refused when a branch targets the interior of the rewritten range.
-Branch targets are gathered from PC-relative direct branches, `switch` jump tables in `.rodata`/`.data.rel.ro`, relocation-derived code pointers (RELA and RELR), exception landing pads (`.eh_frame`/`.gcc_except_table`), and symbol values (`.symtab`/`.dynsym`), so table dispatch, function-pointer entry points, unwinder entry points, and named labels are protected too (see LIMITATIONS.md for what remains invisible).
+Branch targets are gathered from PC-relative direct branches, `switch` jump tables in `.rodata`/`.data.rel.ro`, relocation-derived code pointers (RELA and RELR), exception landing pads (`.eh_frame`/`.gcc_except_table`), symbol values (`.symtab`/`.dynsym`), and `ENDBR` landing sites (which over-approximate every legal indirect target in CET/IBT binaries), so table dispatch, function-pointer entry points, unwinder entry points, and named labels are protected too (see LIMITATIONS.md for what remains invisible).
 As defense in depth against rewriter bugs, every non-dry run re-decodes each section after rewriting and fails if any branch target no longer falls on an instruction boundary.
 
 ### Variable shifts: SHL/SHR/SAR → SHLX/SHRX/SARX (BMI2)

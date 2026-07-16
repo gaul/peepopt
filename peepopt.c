@@ -785,12 +785,14 @@ static bool append_table_base(struct table_base **arr, size_t *n, size_t *cap,
 // interior bytes (i.e., anything other than the rewrite's first byte) is a
 // known jump destination.
 //
-// This covers direct Jcc/JMP/CALL rel. With a non-NULL ctx it additionally
-// covers switch jump tables (int32-relative tables reachable from a
-// RIP-relative LEA into a data section, and absolute tables referenced by
-// memory-indirect JMPs) and relocation-derived code pointers
-// (ctx->extra_targets). Indirect branches whose targets are computed some
-// other way remain a residual risk.
+// This covers direct Jcc/JMP/CALL rel and ENDBR landing sites (which
+// over-approximate every legal indirect target in CET/IBT binaries). With a
+// non-NULL ctx it additionally covers switch jump tables (int32-relative
+// tables reachable from a RIP-relative LEA into a data section, and absolute
+// tables referenced by memory-indirect JMPs) and the code addresses in
+// ctx->extra_targets (relocations, exception landing pads, symbols).
+// Indirect branches whose targets are computed some other way in non-IBT
+// binaries remain a residual risk.
 static int collect_branch_targets(const uint8_t *inst, size_t len,
                                    const struct peepopt_ctx *ctx,
                                    uint8_t *targets)
@@ -823,6 +825,7 @@ static int collect_branch_targets(const uint8_t *inst, size_t len,
         }
         xed_uint_t inst_len = xed_decoded_inst_get_length(&xedd);
         xed_category_enum_t cat = xed_decoded_inst_get_category(&xedd);
+        xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&xedd);
         if (xed_decoded_inst_get_branch_displacement_width(&xedd) > 0 &&
             (cat == XED_CATEGORY_COND_BR ||
              cat == XED_CATEGORY_UNCOND_BR ||
@@ -834,8 +837,21 @@ static int collect_branch_targets(const uint8_t *inst, size_t len,
                 targets[t / 8] |= (uint8_t)(1u << (t % 8));
             }
         }
+        // In CET/IBT binaries every legal indirect-branch target starts
+        // with an ENDBR, so its offset over-approximates all indirect
+        // targets — including ones computed in ways no table, reloc, or
+        // symbol reveals. Marking it both refuses rewrites that would bury
+        // the landing site and stops the gap repack from moving the ENDBR
+        // away from it. Match bytes rather than the iclass: XED decodes
+        // ENDBR64/ENDBR32 (F3 0F 1E FA/FB) as multi-byte NOPs unless CET
+        // decoding is enabled, and enabling it could perturb decode
+        // boundaries relative to the rewrite passes.
+        if (len - off >= 4 && inst[off] == 0xF3 && inst[off + 1] == 0x0F &&
+            inst[off + 2] == 0x1E &&
+            (inst[off + 3] == 0xFA || inst[off + 3] == 0xFB)) {
+            targets[off / 8] |= (uint8_t)(1u << (off % 8));
+        }
         if (ctx != NULL) {
-            xed_iclass_enum_t iclass = xed_decoded_inst_get_iclass(&xedd);
             if (iclass == XED_ICLASS_LEA &&
                 xed_decoded_inst_get_base_reg(&xedd, 0) == XED_REG_RIP) {
                 // Candidate PIC jump-table base: lea table(%rip),%reg.

@@ -2111,6 +2111,28 @@ int main(int argc, char *argv[])
         check_shifts_ctx(__LINE__, 1, bytes, sizeof(bytes), &ctx);
     }
 
+    /* ================= ENDBR landing sites ================= */
+
+    /* An ENDBR64 between MOV1 and the shift is an indirect-branch landing
+       site: the gap repack would move it, breaking every indirect jump that
+       targets it, so the rewrite must refuse. */
+    CHECK_BYTES(
+        0,
+        0x44, 0x89, 0xC1,        // mov %r8d,%ecx
+        0xF3, 0x0F, 0x1E, 0xFA,  // endbr64 (offset 3, indirect target)
+        0xD3, 0xE0,              // shl %cl,%eax
+        0xC3
+    );
+
+    /* Control: the same shape with a plain 4-byte NOP gap still fuses. */
+    CHECK_BYTES(
+        1,
+        0x44, 0x89, 0xC1,        // mov %r8d,%ecx
+        0x0F, 0x1F, 0x40, 0x00,  // 4-byte nop
+        0xD3, 0xE0,              // shl %cl,%eax
+        0xC3
+    );
+
     /* ================= Boundary verifier ================= */
 
     /* A target on an instruction boundary passes; a target inside an
