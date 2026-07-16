@@ -879,6 +879,28 @@ int main(int argc, char **argv)
             .extra_targets = extra_targets,
             .num_extra_targets = num_extra_targets,
         };
+        // Baseline the boundary verifier before touching anything: a target
+        // already inside an instruction (overlapping-instruction tricks in
+        // hand-written assembly) is not our doing and must not fail the
+        // post-rewrite check.
+        size_t *baseline = NULL;
+        size_t num_baseline = 0;
+        if (!dry_run &&
+            peepopt_verify_targets(buf, section_header->sh_size, &ctx,
+                                   &baseline, &num_baseline) < 0) {
+            fprintf(stderr, "verifier baseline failed on section %u\n", idx);
+            free(extra_targets);
+            munmap(addr, file_size);
+            close(fd);
+            return 1;
+        }
+        // Nonzero baselines are common and benign: the table walks
+        // deliberately over-approximate, so some marked bytes were never
+        // real targets and may fall mid-instruction.
+        if (verbose && num_baseline > 0) {
+            printf("section %u: %zu branch targets inside instructions "
+                   "before any rewriting\n", idx, num_baseline);
+        }
         int section_rewrites = check_shifts(buf, section_header->sh_size, /*replace=*/ !dry_run, &ctx);
         if (section_rewrites < 0) {
             fprintf(stderr, "check_shifts failed on section %u\n", idx);
@@ -917,6 +939,49 @@ int main(int argc, char **argv)
             }
             rewrites += apx_rewrites;
         }
+
+        // Post-rewrite check: every branch target must still fall on an
+        // instruction boundary. Any violation not present in the baseline
+        // means a rewrite buried a target — a rewriter bug, and the file
+        // has already been modified, so fail loudly.
+        if (!dry_run) {
+            size_t *post = NULL;
+            size_t num_post = 0;
+            if (peepopt_verify_targets(buf, section_header->sh_size, &ctx,
+                                       &post, &num_post) < 0) {
+                fprintf(stderr, "verifier failed on section %u\n", idx);
+                free(baseline);
+                free(extra_targets);
+                munmap(addr, file_size);
+                close(fd);
+                return 1;
+            }
+            bool bad = false;
+            size_t bi = 0;
+            for (size_t i = 0; i < num_post; i++) {
+                while (bi < num_baseline && baseline[bi] < post[i]) {
+                    ++bi;
+                }
+                if (bi >= num_baseline || baseline[bi] != post[i]) {
+                    fprintf(stderr, "verifier: branch target at "
+                            "section %u offset 0x%zx (va 0x%llx) is inside "
+                            "a rewritten instruction; the output is corrupt\n",
+                            idx, post[i],
+                            (unsigned long long)(section_header->sh_addr +
+                                                 post[i]));
+                    bad = true;
+                }
+            }
+            free(post);
+            if (bad) {
+                free(baseline);
+                free(extra_targets);
+                munmap(addr, file_size);
+                close(fd);
+                return 1;
+            }
+        }
+        free(baseline);
     }
     free(extra_targets);
 

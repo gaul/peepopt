@@ -924,6 +924,65 @@ static bool target_in_interior(const uint8_t *targets, size_t lo, size_t hi)
     return false;
 }
 
+int peepopt_verify_targets(const uint8_t *inst, size_t len,
+                           const struct peepopt_ctx *ctx,
+                           size_t **violations, size_t *num_violations)
+{
+    *violations = NULL;
+    *num_violations = 0;
+    size_t bitmap_bytes = len > 0 ? (len + 7) / 8 : 1;
+    uint8_t *targets = calloc(bitmap_bytes, 1);
+    uint8_t *bounds = calloc(bitmap_bytes, 1);
+    if (targets == NULL || bounds == NULL ||
+        collect_branch_targets(inst, len, ctx, targets) < 0) {
+        free(targets);
+        free(bounds);
+        return -1;
+    }
+
+    // Mark every instruction start; a decode error ends what the rewrite
+    // passes can reach, so targets past it cannot have been disturbed.
+    xed_machine_mode_enum_t mmode = XED_MACHINE_MODE_LONG_64;
+    xed_address_width_enum_t stack_addr_width = XED_ADDRESS_WIDTH_64b;
+    size_t decoded_end = 0;
+    for (size_t off = 0; off < len;) {
+        xed_decoded_inst_t xedd;
+        xed_decoded_inst_zero(&xedd);
+        xed_decoded_inst_set_mode(&xedd, mmode, stack_addr_width);
+        if (xed_decode(&xedd, inst + off, len - off) != XED_ERROR_NONE) {
+            break;
+        }
+        bounds[off / 8] |= (uint8_t)(1u << (off % 8));
+        off += xed_decoded_inst_get_length(&xedd);
+        decoded_end = off;
+    }
+
+    size_t cap = 0;
+    for (size_t t = 0; t < decoded_end; t++) {
+        uint8_t mask = (uint8_t)(1u << (t % 8));
+        if ((targets[t / 8] & mask) && !(bounds[t / 8] & mask)) {
+            if (*num_violations == cap) {
+                size_t new_cap = cap == 0 ? 16 : cap * 2;
+                size_t *p = realloc(*violations, new_cap * sizeof(**violations));
+                if (p == NULL) {
+                    free(*violations);
+                    *violations = NULL;
+                    *num_violations = 0;
+                    free(targets);
+                    free(bounds);
+                    return -1;
+                }
+                *violations = p;
+                cap = new_cap;
+            }
+            (*violations)[(*num_violations)++] = t;
+        }
+    }
+    free(targets);
+    free(bounds);
+    return 0;
+}
+
 int check_shifts(uint8_t *inst, size_t len, bool replace,
                  const struct peepopt_ctx *ctx)
 {

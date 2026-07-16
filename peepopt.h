@@ -45,6 +45,14 @@ struct peepopt_ctx {
 
 void peepopt_set_verbose(bool verbose);
 void peepopt_print_stats(void);
+// Defense in depth: decode the section and report every collected branch
+// target that does not fall on an instruction boundary, as ascending offsets
+// in a malloc'd array the caller frees. Run before rewriting to baseline any
+// pre-existing oddities and after rewriting to prove no target was buried
+// inside a rewritten instruction. Returns 0 or -1 on failure.
+int peepopt_verify_targets(const uint8_t *inst, size_t len,
+                           const struct peepopt_ctx *ctx,
+                           size_t **violations, size_t *num_violations);
 int check_shifts(uint8_t *inst, size_t len, bool replace,
                  const struct peepopt_ctx *ctx);
 int check_andn(uint8_t *inst, size_t len, bool replace,

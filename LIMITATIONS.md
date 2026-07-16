@@ -47,4 +47,8 @@ bounds what it can safely touch.
 
 Within these bounds peepopt errs toward refusing a rewrite rather than
 performing an unsafe one, and includes soundness tests for the classes
-of hazard above that it does handle.
+of hazard above that it does handle. As a final check, every non-dry
+run re-decodes each rewritten section and fails if any collected branch
+target no longer falls on an instruction boundary (targets already
+inside instructions before rewriting are baselined and ignored, since
+the conservative target collection over-approximates).

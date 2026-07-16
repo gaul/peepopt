@@ -2111,5 +2111,88 @@ int main(int argc, char *argv[])
         check_shifts_ctx(__LINE__, 1, bytes, sizeof(bytes), &ctx);
     }
 
+    /* ================= Boundary verifier ================= */
+
+    /* A target on an instruction boundary passes; a target inside an
+       instruction is reported. */
+    {
+        uint8_t bytes[] = {
+            0x48, 0x89, 0xF0,        // mov %rsi,%rax (offset 0)
+            0x48, 0x01, 0xC8,        // add %rcx,%rax (offset 3)
+            0xC3,                    // ret           (offset 6)
+        };
+        uint64_t on_boundary = 0x1003;
+        struct peepopt_ctx ctx = {
+            .text_vaddr = 0x1000,
+            .extra_targets = &on_boundary,
+            .num_extra_targets = 1,
+        };
+        size_t *violations;
+        size_t num_violations;
+        if (peepopt_verify_targets(bytes, sizeof(bytes), &ctx, &violations,
+                                   &num_violations) != 0 ||
+            num_violations != 0) {
+            fprintf(stderr, "peepopt_test.c:%d: expected no violations\n",
+                    __LINE__);
+            ++failures;
+        }
+        free(violations);
+
+        uint64_t interior = 0x1004;  // second byte of the add
+        ctx.extra_targets = &interior;
+        if (peepopt_verify_targets(bytes, sizeof(bytes), &ctx, &violations,
+                                   &num_violations) != 0 ||
+            num_violations != 1 || violations[0] != 4) {
+            fprintf(stderr, "peepopt_test.c:%d: expected violation at 4\n",
+                    __LINE__);
+            ++failures;
+        }
+        free(violations);
+    }
+
+    /* A direct branch into an instruction interior is reported even with no
+       ctx (the classic overlapping-instruction shape). */
+    {
+        uint8_t bytes[] = {
+            0xEB, 0x01,              // jmp +1 (target = offset 3)
+            0x66, 0x90,              // 2-byte nop (offsets 2-3)
+            0xC3,                    // ret
+        };
+        size_t *violations;
+        size_t num_violations;
+        if (peepopt_verify_targets(bytes, sizeof(bytes), NULL, &violations,
+                                   &num_violations) != 0 ||
+            num_violations != 1 || violations[0] != 3) {
+            fprintf(stderr, "peepopt_test.c:%d: expected violation at 3\n",
+                    __LINE__);
+            ++failures;
+        }
+        free(violations);
+    }
+
+    /* A legitimate rewrite leaves every target on a boundary: the jump to
+       the pair's first byte stays valid after the SHLX replacement. */
+    {
+        uint8_t bytes[] = {
+            0xEB, 0x00,              // jmp +0 (target = offset 2)
+            0x44, 0x89, 0xC1,        // mov %r8d,%ecx
+            0xD3, 0xE0,              // shl %cl,%eax
+            0xC3,                    // ret
+        };
+        int got = check_shifts(bytes, sizeof(bytes), /*replace=*/ true,
+                               /*ctx=*/ NULL);
+        size_t *violations;
+        size_t num_violations;
+        if (got != 1 ||
+            peepopt_verify_targets(bytes, sizeof(bytes), NULL, &violations,
+                                   &num_violations) != 0 ||
+            num_violations != 0) {
+            fprintf(stderr, "peepopt_test.c:%d: rewrite broke a boundary\n",
+                    __LINE__);
+            ++failures;
+        }
+        free(violations);
+    }
+
     return failures == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
